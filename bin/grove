@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# grove — spawn parallel Claude Code agents in git worktrees, grouped in cmux.
+#
+# Glue layer over worktrunk (`wt`) + cmux + Claude Code: `grove go <branch>
+# <prompt>` creates a worktree and opens a cmux workspace running Claude on that
+# prompt, filed under the repo's sidebar group (anchor = main checkout).
+#
+# https://github.com/jlopez/grove
+set -euo pipefail
+
+GROVE_VERSION="0.1.0"
+
+# ---- output helpers ---------------------------------------------------------
+if [ -t 2 ]; then
+  _c_red=$'\033[31m'; _c_grn=$'\033[32m'; _c_ylw=$'\033[33m'
+  _c_dim=$'\033[2m'; _c_bld=$'\033[1m'; _c_rst=$'\033[0m'
+else
+  _c_red=; _c_grn=; _c_ylw=; _c_dim=; _c_bld=; _c_rst=
+fi
+err()  { printf '%sgrove:%s %s\n' "$_c_red" "$_c_rst" "$*" >&2; }
+info() { printf '%sgrove:%s %s\n' "$_c_grn" "$_c_rst" "$*" >&2; }
+warn() { printf '%sgrove:%s %s\n' "$_c_ylw" "$_c_rst" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---- cmux binary discovery --------------------------------------------------
+grove_cmux() {
+  if [ -n "${GROVE_CMUX:-}" ]; then echo "$GROVE_CMUX"; return; fi
+  if command -v cmux >/dev/null 2>&1; then command -v cmux; return; fi
+  local app="/Applications/cmux.app/Contents/Resources/bin/cmux"
+  [ -x "$app" ] && { echo "$app"; return; }
+  return 1
+}
+
+# ---- repo identity (main checkout, regardless of which worktree we're in) ---
+# Sets: REPO (name), REPO_PATH (absolute main-checkout dir)
+grove_repo_identity() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not inside a git repository"
+  local common
+  common=$(git rev-parse --git-common-dir)
+  # Absolutize (git may print a relative .git path) and strip trailing /.git
+  common=$(cd "$common" && pwd)
+  REPO_PATH=$(dirname "$common")
+  REPO=$(basename "$REPO_PATH")
+}
+
+# =============================================================================
+# grove go <branch> [prompt...]
+# =============================================================================
+grove_go() {
+  [ $# -ge 1 ] || die "usage: grove go <branch> [prompt...]"
+  local branch="$1"; shift
+  local prompt="${*:-}"
+
+  command -v wt >/dev/null 2>&1 || die "worktrunk (wt) not found — see 'grove doctor'"
+  command -v jq >/dev/null 2>&1 || die "jq not found — see 'grove doctor'"
+  local CMUX; CMUX=$(grove_cmux) || die "cmux CLI not found — see 'grove doctor'"
+
+  grove_repo_identity
+
+  # 1. Create the worktree (fires worktrunk pre-start hooks, e.g. multi-account).
+  info "creating worktree for '$branch'…"
+  wt switch -c "$branch" --no-cd -y \
+    || die "worktree creation failed (does branch '$branch' already exist?)"
+
+  # 2. Resolve the new worktree's path.
+  local wtpath
+  wtpath=$(wt list --format json | jq -r --arg b "$branch" \
+    '.[] | select(.branch==$b) | .path' | head -1)
+  [ -n "$wtpath" ] || die "could not resolve worktree path for '$branch'"
+
+  # 3. Build the command cmux types into the new workspace's shell. Quote the
+  #    prompt so the agent receives it as a single initial-prompt argument.
+  local agent="${GROVE_AGENT:-claude}" launch
+  if [ -n "$prompt" ]; then
+    launch="$agent $(printf '%q' "$prompt")"
+  else
+    launch="$agent"
+  fi
+
+  # 4. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
+  local ws
+  ws=$(CMUX_QUIET=1 "$CMUX" workspace create \
+        --cwd "$wtpath" --name "$branch" --command "$launch" --json \
+        | jq -r '.workspace_ref')
+  { [ -n "$ws" ] && [ "$ws" != "null" ]; } || die "cmux workspace create failed"
+
+  # 5. File under the repo group; create it (anchor = main checkout) on first use.
+  local gid
+  gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
+        | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
+  if [ -n "$gid" ]; then
+    CMUX_QUIET=1 "$CMUX" workspace-group add --group "$gid" --workspace "$ws" >/dev/null
+  else
+    CMUX_QUIET=1 "$CMUX" workspace-group create \
+      --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json >/dev/null
+  fi
+
+  CMUX_QUIET=1 "$CMUX" workspace select "$ws" >/dev/null 2>&1 || true
+  info "spawned ${_c_bld}$ws${_c_rst} ($branch) under group '${_c_bld}$REPO${_c_rst}'"
+  printf '%s\n' "$wtpath"
+}
+
+# =============================================================================
+# grove doctor — verify dependencies and wiring
+# =============================================================================
+grove_doctor() {
+  local ok=0
+  _chk() { # name  test-cmd  hint
+    if eval "$2" >/dev/null 2>&1; then
+      printf '  %s✓%s %s\n' "$_c_grn" "$_c_rst" "$1"
+    else
+      printf '  %s✗%s %s %s(%s)%s\n' "$_c_red" "$_c_rst" "$1" "$_c_dim" "$3" "$_c_rst"
+      ok=1
+    fi
+  }
+  printf '%sgrove doctor%s (v%s)\n' "$_c_bld" "$_c_rst" "$GROVE_VERSION"
+  printf '\n%sRequired:%s\n' "$_c_bld" "$_c_rst"
+  _chk "worktrunk (wt)" "command -v wt"                 "brew install worktrunk"
+  _chk "cmux CLI"        "grove_cmux"                    "install cmux.app from cmux.dev"
+  _chk "jq"              "command -v jq"                  "brew install jq"
+  _chk "git"             "command -v git"                "xcode-select --install"
+  _chk "claude"          "command -v ${GROVE_AGENT:-claude}" "install Claude Code"
+  printf '\n%sOptional:%s\n' "$_c_bld" "$_c_rst"
+  _chk "direnv (multi-account)" "command -v direnv"       "brew install direnv"
+  _chk "cmux Claude plugin"     "test -n \"\$(wt config show 2>/dev/null | grep -i 'Plugin installed')\"" \
+                                "wt config plugins claude install"
+  _chk "wt go alias"            "wt config show 2>/dev/null | grep -qE '^\s*go\s*='" \
+                                "grove init"
+  [ -n "${CMUX_WORKSPACE_ID:-}" ] \
+    && printf '\n%s✓ running inside cmux%s (window targeting works)\n' "$_c_grn" "$_c_rst" \
+    || printf '\n%s!%s not inside a cmux workspace — %sgrove go%s targets cmux best when run from a cmux tab\n' \
+         "$_c_ylw" "$_c_rst" "$_c_bld" "$_c_rst"
+  return $ok
+}
+
+# =============================================================================
+# grove init [--with-multi-account] — optional wiring
+# =============================================================================
+GROVE_CONFIG="${WORKTRUNK_CONFIG:-$HOME/.config/worktrunk/config.toml}"
+
+grove_init() {
+  local want_multi=0
+  for a in "$@"; do
+    case "$a" in
+      --with-multi-account) want_multi=1 ;;
+      -h|--help) echo "usage: grove init [--with-multi-account]"; return 0 ;;
+      *) die "grove init: unknown option '$a'" ;;
+    esac
+  done
+
+  command -v wt >/dev/null 2>&1 || die "worktrunk (wt) required first — see 'grove doctor'"
+  mkdir -p "$(dirname "$GROVE_CONFIG")"
+  [ -f "$GROVE_CONFIG" ] || { warn "no worktrunk config; creating one"; wt config create >/dev/null 2>&1 || true; }
+  touch "$GROVE_CONFIG"
+
+  # 1. cmux Claude plugin (activity markers + statusline source).
+  if wt config show 2>/dev/null | grep -qi "Plugin installed"; then
+    info "cmux Claude plugin already installed"
+  else
+    info "installing cmux Claude plugin…"
+    if wt config plugins claude install --yes >/dev/null 2>&1; then
+      info "  done"
+    else
+      warn "  skipped (install manually: wt config plugins claude install)"
+    fi
+  fi
+
+  # 2. wt go alias (sugar for `grove go`).
+  if grep -qE '^\s*go\s*=' "$GROVE_CONFIG"; then
+    info "'wt go' alias already present"
+  else
+    info "adding 'wt go' alias to $GROVE_CONFIG"
+    if grep -qE '^\s*\[aliases\]' "$GROVE_CONFIG"; then
+      # append under existing [aliases]
+      awk '1; /^\[aliases\]/ && !done { print "go = \"grove go {{ args[0] }} {{ args[1:] | join('"'"' '"'"') }}\""; done=1 }' \
+        "$GROVE_CONFIG" > "$GROVE_CONFIG.tmp" && mv "$GROVE_CONFIG.tmp" "$GROVE_CONFIG"
+    else
+      printf '\n[aliases]\ngo = "grove go {{ args[0] }} {{ args[1:] | join('"'"' '"'"') }}"\n' >> "$GROVE_CONFIG"
+    fi
+  fi
+
+  # 3. Optional multi-account direnv hook.
+  if [ "$want_multi" = 1 ]; then
+    if grep -qE '^\s*gh-account\s*=' "$GROVE_CONFIG"; then
+      info "multi-account hook already present"
+    elif ! command -v direnv >/dev/null 2>&1; then
+      warn "multi-account requested but direnv not found; skipping (brew install direnv)"
+    else
+      info "adding multi-account pre-start hook"
+      cat >> "$GROVE_CONFIG" <<'TOML'
+
+# grove: per-worktree GH_CONFIG_DIR inherited from the main checkout's direnv.
+[pre-start]
+gh-account = """
+ghdir=$(direnv exec {{ primary_worktree_path }} sh -c 'printf %s "$GH_CONFIG_DIR"')
+if [ -n "$ghdir" ]; then
+  printf 'export GH_CONFIG_DIR=%s\n' "$ghdir" > {{ worktree_path }}/.envrc
+  direnv allow {{ worktree_path }}
+fi
+"""
+TOML
+    fi
+  fi
+
+  info "init complete — try: ${_c_bld}grove go feature/test draft a hello-world${_c_rst}"
+  [ "$want_multi" = 1 ] || info "multi-account direnv inheritance available via ${_c_bld}grove init --with-multi-account${_c_rst}"
+}
+
+# ---- dispatch ---------------------------------------------------------------
+grove_usage() {
+  cat <<EOF
+${_c_bld}grove${_c_rst} v$GROVE_VERSION — parallel Claude agents in worktrees, grouped in cmux
+
+${_c_bld}Usage:${_c_rst}
+  grove go <branch> [prompt...]   Create a worktree + spawn a cmux Claude agent
+  grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
+  grove doctor                    Check dependencies and wiring
+  grove version
+
+${_c_bld}Env:${_c_rst}
+  GROVE_AGENT   command to launch (default: claude)
+  GROVE_CMUX    path to the cmux CLI (default: auto-detect)
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    go)            grove_go "$@" ;;
+    init)          grove_init "$@" ;;
+    doctor)        grove_doctor "$@" ;;
+    version|--version|-V) echo "grove v$GROVE_VERSION" ;;
+    help|--help|-h|"") grove_usage ;;
+    *) err "unknown command '$cmd'"; grove_usage; exit 1 ;;
+  esac
+}
+main "$@"
