@@ -31,8 +31,12 @@ grove_cmux() {
   return 1
 }
 
-# ---- repo identity (main checkout, regardless of which worktree we're in) ---
-# Sets: REPO (name), REPO_PATH (absolute main-checkout dir)
+# ---- repo identity ----------------------------------------------------------
+# Sets: REPO (name) and REPO_PATH (main-checkout dir) — the group's stable
+# identity, used for the cmux group name and the deterministic color; and
+# WORKTREE_ROOT — the root of the worktree grove was invoked from, which is
+# where .grove.json is read/written (so styling is committable on your branch
+# and takes effect immediately, instead of dirtying the main checkout).
 grove_repo_identity() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not inside a git repository"
@@ -42,6 +46,7 @@ grove_repo_identity() {
   common=$(cd "$common" && pwd)
   REPO_PATH=$(dirname "$common")
   REPO=$(basename "$REPO_PATH")
+  WORKTREE_ROOT=$(git rev-parse --show-toplevel)
 }
 
 # ---- group styling ----------------------------------------------------------
@@ -76,11 +81,19 @@ grove_color_for() {
   printf '%s\n' "${GROVE_PALETTE[$idx]}"
 }
 
-# grove_resolve_style <repo> <repo-path> — sets STYLE_COLOR / STYLE_ICON.
+# grove_random_color -> a random palette hex (backs `restyle --color random`,
+# which stamps the *picked* hex into .grove.json — never the word "random").
+grove_random_color() {
+  printf '%s\n' "${GROVE_PALETTE[$((RANDOM % ${#GROVE_PALETTE[@]}))]}"
+}
+
+# grove_resolve_style <repo> <style-root> — sets STYLE_COLOR / STYLE_ICON.
 #   STYLE_COLOR: "#RRGGBB" to apply, or "INHERIT" to clear (let byCwd/settings show).
-#   STYLE_ICON:  SF Symbol to apply, or "" to leave the group's icon untouched.
-# Reads <repo-path>/.grove.json: { "color"?, "icon"? }. color absent/"auto" →
-# deterministic; "inherit" → clear; "#RRGGBB" → explicit. icon absent → leave.
+#   STYLE_ICON:  SF Symbol to apply, or "" to CLEAR (revert to byCwd/default icon).
+# Reads <style-root>/.grove.json: { "color"?, "icon"? }. color absent/"auto" →
+# deterministic; "inherit" → clear; "#RRGGBB" → explicit. icon absent → clear.
+# Both attributes fully reconcile: removing a key reverts grove's imperative
+# state for it, so persistent styling lives in .grove.json or byCwd.
 grove_resolve_style() {
   local repo="$1" f="$2/.grove.json" cval="" ival=""
   if [ -f "$f" ]; then
@@ -113,16 +126,22 @@ grove_apply_style() {
   fi
   if [ -n "$STYLE_ICON" ]; then
     CMUX_QUIET=1 "$cmux" workspace-group set-icon "$g" --symbol "$STYLE_ICON" >/dev/null 2>&1 || true
+  else
+    CMUX_QUIET=1 "$cmux" workspace-group set-icon "$g" >/dev/null 2>&1 || true
   fi
 }
 
-# grove_write_style <repo-path> <color> <icon> — merge non-empty values into
-# <repo-path>/.grove.json (created if absent), preserving any other keys.
+# grove_write_style <style-root> <color> <icon> — merge into
+# <style-root>/.grove.json (created if absent), preserving any other keys.
+# Empty color/icon = leave that key untouched; icon "none" = delete the key.
 grove_write_style() {
   local f="$1/.grove.json" color="$2" icon="$3" base='{}' out
   [ -f "$f" ] && jq -e . "$f" >/dev/null 2>&1 && base=$(cat "$f")
   out=$(printf '%s' "$base" | jq --arg c "$color" --arg i "$icon" \
-        '(if $c != "" then .color = $c else . end) | (if $i != "" then .icon = $i else . end)') \
+        '(if $c != "" then .color = $c else . end)
+         | (if   $i == "none" then del(.icon)
+            elif  $i != ""     then .icon = $i
+            else  . end)') \
     || die "failed to update $f"
   printf '%s\n' "$out" > "$f"
   info "wrote $f"
@@ -180,9 +199,10 @@ grove_go() {
             --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
   fi
 
-  # 6. Reconcile group styling from .grove.json (deterministic color by default).
+  # 6. Reconcile group styling from this worktree's .grove.json (deterministic
+  #    color by default).
   { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
-    && grove_apply_style "$CMUX" "$gid" "$REPO" "$REPO_PATH"
+    && grove_apply_style "$CMUX" "$gid" "$REPO" "$WORKTREE_ROOT"
 
   CMUX_QUIET=1 "$CMUX" workspace select "$ws" >/dev/null 2>&1 || true
   info "spawned ${_c_bld}$ws${_c_rst} ($branch) under group '${_c_bld}$REPO${_c_rst}'"
@@ -190,39 +210,50 @@ grove_go() {
 }
 
 # =============================================================================
-# grove restyle [--color #RRGGBB] [--icon <sf-symbol>]
+# grove restyle [--color #RRGGBB|auto|random|inherit] [--icon <sf-symbol>|none]
 # Re-apply this repo's group style without spawning an agent. With --color/--icon
-# it writes .grove.json first (so hand-editing JSON is optional), then applies.
+# it writes this worktree's .grove.json first (so hand-editing JSON is optional),
+# then applies. --color random stamps a random palette hex; --icon none drops it.
 # =============================================================================
 grove_restyle() {
-  local set_color="" set_icon="" write=0
+  local set_color="" set_icon="" color_set=0 icon_set=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --color) [ $# -ge 2 ] || die "grove restyle: --color needs a value (#RRGGBB | auto | inherit)"
-               set_color="$2"; write=1; shift 2 ;;
-      --icon)  [ $# -ge 2 ] || die "grove restyle: --icon needs an SF Symbol name"
-               set_icon="$2"; write=1; shift 2 ;;
-      -h|--help) echo "usage: grove restyle [--color #RRGGBB|auto|inherit] [--icon <sf-symbol>]"; return 0 ;;
+      --color) [ $# -ge 2 ] || die "grove restyle: --color needs a value (#RRGGBB | auto | random | inherit)"
+               set_color="$2"; color_set=1; shift 2 ;;
+      --icon)  [ $# -ge 2 ] || die "grove restyle: --icon needs an SF Symbol name (or 'none')"
+               set_icon="$2"; icon_set=1; shift 2 ;;
+      -h|--help) echo "usage: grove restyle [--color #RRGGBB|auto|random|inherit] [--icon <sf-symbol>|none]"; return 0 ;;
       *) die "grove restyle: unknown option '$1'" ;;
     esac
   done
-  case "$set_color" in
-    ''|auto|inherit|'#'[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;;
-    *) die "grove restyle: --color '$set_color' must be #RRGGBB, auto, or inherit" ;;
-  esac
+  if [ "$color_set" = 1 ]; then
+    case "$set_color" in
+      auto|random|inherit|'#'[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;;
+      *) die "grove restyle: --color '$set_color' must be #RRGGBB, auto, random, or inherit" ;;
+    esac
+    # random resolves to a concrete palette hex now, so .grove.json stays stable.
+    [ "$set_color" = random ] && set_color=$(grove_random_color)
+  fi
+  # an empty --icon means "drop the icon"; normalize to the delete sentinel.
+  [ "$icon_set" = 1 ] && [ -z "$set_icon" ] && set_icon="none"
+  # values to write: "" means "leave this key alone".
+  [ "$color_set" = 1 ] || set_color=""
+  [ "$icon_set"  = 1 ] || set_icon=""
 
   command -v jq >/dev/null 2>&1 || die "jq not found — see 'grove doctor'"
   local CMUX; CMUX=$(grove_cmux) || die "cmux CLI not found — see 'grove doctor'"
   grove_repo_identity
 
-  [ "$write" = 1 ] && grove_write_style "$REPO_PATH" "$set_color" "$set_icon"
+  { [ "$color_set" = 1 ] || [ "$icon_set" = 1 ]; } \
+    && grove_write_style "$WORKTREE_ROOT" "$set_color" "$set_icon"
 
   local gid
   gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
         | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
   [ -n "$gid" ] || { warn "no cmux group for '$REPO' yet — run 'grove go' first"; return 0; }
 
-  grove_apply_style "$CMUX" "$gid" "$REPO" "$REPO_PATH"
+  grove_apply_style "$CMUX" "$gid" "$REPO" "$WORKTREE_ROOT"
   info "restyled group '${_c_bld}$REPO${_c_rst}'"
 }
 
@@ -345,9 +376,10 @@ ${_c_bld}Usage:${_c_rst}
   grove version
 
 ${_c_bld}Per-repo styling:${_c_rst}
-  <main-checkout>/.grove.json = { "color"?, "icon"? }
+  <repo-root>/.grove.json = { "color"?, "icon"? }   (read from the worktree you run grove in)
   color: #RRGGBB | "auto" (deterministic from repo name) | "inherit" (clear)
-  icon:  an SF Symbol name (e.g. "leaf.fill"); omit to leave unchanged
+  icon:  an SF Symbol name (e.g. "leaf.fill"); omit to clear (use byCwd/default)
+  restyle --color random stamps a random palette color; --icon none drops the icon
 
 ${_c_bld}Env:${_c_rst}
   GROVE_AGENT   command to launch (default: claude)

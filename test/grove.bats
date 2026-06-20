@@ -131,3 +131,37 @@ GROVE="${BATS_TEST_DIRNAME}/../bin/grove"
   [ "$(jq -r '.color' "$d/.grove.json")" = "#ABCDEF" ]
   [ "$(jq -r '.icon'  "$d/.grove.json")" = "star.fill" ]
 }
+
+@test "write_style: icon 'none' deletes the key, keeps color" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/del"; mkdir -p "$d"
+  printf '%s\n' '{ "color": "#111111", "icon": "leaf.fill" }' > "$d/.grove.json"
+  grove_write_style "$d" "" "none" >/dev/null
+  [ "$(jq -r '.color' "$d/.grove.json")" = "#111111" ]
+  [ "$(jq 'has("icon")' "$d/.grove.json")" = "false" ]
+}
+
+@test "grove_random_color returns a palette hex" {
+  set +eu
+  source "$GROVE"
+  local c; c=$(grove_random_color)
+  [[ "$c" =~ ^#[0-9A-Fa-f]{6}$ ]]
+  printf '%s\n' "${GROVE_PALETTE[@]}" | grep -qx "$c"
+}
+
+@test "restyle --color random passes validation (no validation error)" {
+  # Run from a non-git temp dir so it bails at repo-identity BEFORE writing
+  # any .grove.json or touching cmux — we only assert validation accepted it.
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" restyle --color random
+  [ "$status" -ne 0 ]                       # bails (no git repo / no cmux)
+  [[ "$output" != *"must be #RRGGBB"* ]]    # but NOT a validation rejection
+}
+
+@test "restyle --color rejects a bogus keyword" {
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" restyle --color chartreuse
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be #RRGGBB"* ]]
+}
