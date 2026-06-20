@@ -44,6 +44,90 @@ grove_repo_identity() {
   REPO=$(basename "$REPO_PATH")
 }
 
+# ---- group styling ----------------------------------------------------------
+# 48-cell OKLCH palette: 24 hues × 2 lightness tiers (L≈0.74 / 0.62, C≈0.13),
+# generated offline and gamut-fitted so every cell clears contrast on both light
+# and dark sidebars. Perceptually even (OKLCH, not HSL) — only hue/lightness vary.
+GROVE_PALETTE=(
+  '#ED86A7' '#F18790' '#F28979' '#EE8F63' '#E6964F' '#DA9E3F' '#CBA63A' '#B7AF41'
+  '#A0B751' '#86BD67' '#69C27E' '#47C496' '#1DC5AE' '#03C3C3' '#11C0D6' '#2EBBE8'
+  '#52B5F4' '#70ADFB' '#8BA6FD' '#A39EF9' '#B897F0' '#CA91E3' '#D98CD2' '#E488BE'
+  '#C46183' '#C8626D' '#C86556' '#C56A3E' '#BE7125' '#B37903' '#A48203' '#928A07'
+  '#7C9128' '#629742' '#429C5A' '#029E72' '#0F9B89' '#169999' '#0897A9' '#1394BA'
+  '#248FCC' '#4C88D3' '#6880D4' '#7F79D1' '#9372C8' '#A36CBC' '#B167AB' '#BC6398'
+)
+
+# grove_hash <string> -> short hex digest, stable across macOS/Linux.
+grove_hash() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum | cut -c1-8
+  elif command -v sha1sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha1sum | cut -c1-8
+  else
+    printf '%x' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+  fi
+}
+
+# grove_color_for <repo-name> -> deterministic palette hex (same name → same hue).
+grove_color_for() {
+  local hexh idx
+  hexh=$(grove_hash "$1")
+  idx=$(( 16#$hexh % ${#GROVE_PALETTE[@]} ))
+  printf '%s\n' "${GROVE_PALETTE[$idx]}"
+}
+
+# grove_resolve_style <repo> <repo-path> — sets STYLE_COLOR / STYLE_ICON.
+#   STYLE_COLOR: "#RRGGBB" to apply, or "INHERIT" to clear (let byCwd/settings show).
+#   STYLE_ICON:  SF Symbol to apply, or "" to leave the group's icon untouched.
+# Reads <repo-path>/.grove.json: { "color"?, "icon"? }. color absent/"auto" →
+# deterministic; "inherit" → clear; "#RRGGBB" → explicit. icon absent → leave.
+grove_resolve_style() {
+  local repo="$1" f="$2/.grove.json" cval="" ival=""
+  if [ -f "$f" ]; then
+    if jq -e . "$f" >/dev/null 2>&1; then
+      cval=$(jq -r '.color // "auto"' "$f")
+      ival=$(jq -r 'if (.icon|type)=="string" then .icon else empty end' "$f")
+    else
+      warn ".grove.json is not valid JSON — falling back to a deterministic color"
+    fi
+  fi
+  case "$cval" in
+    ''|auto)  STYLE_COLOR=$(grove_color_for "$repo") ;;
+    inherit)  STYLE_COLOR="INHERIT" ;;
+    '#'[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) STYLE_COLOR="$cval" ;;
+    *)        warn ".grove.json color '$cval' invalid (want #RRGGBB | auto | inherit) — using deterministic"
+              STYLE_COLOR=$(grove_color_for "$repo") ;;
+  esac
+  STYLE_ICON="$ival"
+}
+
+# grove_apply_style <cmux> <group-ref> <repo> <repo-path> — reconcile cmux's
+# imperative group style to .grove.json/deterministic. Idempotent; safe to re-run.
+grove_apply_style() {
+  local cmux="$1" g="$2"
+  grove_resolve_style "$3" "$4"
+  if [ "$STYLE_COLOR" = "INHERIT" ]; then
+    CMUX_QUIET=1 "$cmux" workspace-group set-color "$g" >/dev/null 2>&1 || true
+  else
+    CMUX_QUIET=1 "$cmux" workspace-group set-color "$g" --hex "$STYLE_COLOR" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$STYLE_ICON" ]; then
+    CMUX_QUIET=1 "$cmux" workspace-group set-icon "$g" --symbol "$STYLE_ICON" >/dev/null 2>&1 || true
+  fi
+}
+
+# grove_write_style <repo-path> <color> <icon> — merge non-empty values into
+# <repo-path>/.grove.json (created if absent), preserving any other keys.
+grove_write_style() {
+  local f="$1/.grove.json" color="$2" icon="$3" base='{}' out
+  [ -f "$f" ] && jq -e . "$f" >/dev/null 2>&1 && base=$(cat "$f")
+  out=$(printf '%s' "$base" | jq --arg c "$color" --arg i "$icon" \
+        '(if $c != "" then .color = $c else . end) | (if $i != "" then .icon = $i else . end)') \
+    || die "failed to update $f"
+  printf '%s\n' "$out" > "$f"
+  info "wrote $f"
+}
+
 # =============================================================================
 # grove go <branch> [prompt...]
 # =============================================================================
@@ -92,13 +176,54 @@ grove_go() {
   if [ -n "$gid" ]; then
     CMUX_QUIET=1 "$CMUX" workspace-group add --group "$gid" --workspace "$ws" >/dev/null
   else
-    CMUX_QUIET=1 "$CMUX" workspace-group create \
-      --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json >/dev/null
+    gid=$(CMUX_QUIET=1 "$CMUX" workspace-group create \
+            --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
   fi
+
+  # 6. Reconcile group styling from .grove.json (deterministic color by default).
+  { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
+    && grove_apply_style "$CMUX" "$gid" "$REPO" "$REPO_PATH"
 
   CMUX_QUIET=1 "$CMUX" workspace select "$ws" >/dev/null 2>&1 || true
   info "spawned ${_c_bld}$ws${_c_rst} ($branch) under group '${_c_bld}$REPO${_c_rst}'"
   printf '%s\n' "$wtpath"
+}
+
+# =============================================================================
+# grove restyle [--color #RRGGBB] [--icon <sf-symbol>]
+# Re-apply this repo's group style without spawning an agent. With --color/--icon
+# it writes .grove.json first (so hand-editing JSON is optional), then applies.
+# =============================================================================
+grove_restyle() {
+  local set_color="" set_icon="" write=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --color) [ $# -ge 2 ] || die "grove restyle: --color needs a value (#RRGGBB | auto | inherit)"
+               set_color="$2"; write=1; shift 2 ;;
+      --icon)  [ $# -ge 2 ] || die "grove restyle: --icon needs an SF Symbol name"
+               set_icon="$2"; write=1; shift 2 ;;
+      -h|--help) echo "usage: grove restyle [--color #RRGGBB|auto|inherit] [--icon <sf-symbol>]"; return 0 ;;
+      *) die "grove restyle: unknown option '$1'" ;;
+    esac
+  done
+  case "$set_color" in
+    ''|auto|inherit|'#'[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;;
+    *) die "grove restyle: --color '$set_color' must be #RRGGBB, auto, or inherit" ;;
+  esac
+
+  command -v jq >/dev/null 2>&1 || die "jq not found — see 'grove doctor'"
+  local CMUX; CMUX=$(grove_cmux) || die "cmux CLI not found — see 'grove doctor'"
+  grove_repo_identity
+
+  [ "$write" = 1 ] && grove_write_style "$REPO_PATH" "$set_color" "$set_icon"
+
+  local gid
+  gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
+        | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
+  [ -n "$gid" ] || { warn "no cmux group for '$REPO' yet — run 'grove go' first"; return 0; }
+
+  grove_apply_style "$CMUX" "$gid" "$REPO" "$REPO_PATH"
+  info "restyled group '${_c_bld}$REPO${_c_rst}'"
 }
 
 # =============================================================================
@@ -214,9 +339,15 @@ ${_c_bld}grove${_c_rst} v$GROVE_VERSION — parallel Claude agents in worktrees,
 
 ${_c_bld}Usage:${_c_rst}
   grove go <branch> [prompt...]   Create a worktree + spawn a cmux Claude agent
+  grove restyle [--color C] [--icon S]   Re-apply this repo's group color/icon
   grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
   grove doctor                    Check dependencies and wiring
   grove version
+
+${_c_bld}Per-repo styling:${_c_rst}
+  <main-checkout>/.grove.json = { "color"?, "icon"? }
+  color: #RRGGBB | "auto" (deterministic from repo name) | "inherit" (clear)
+  icon:  an SF Symbol name (e.g. "leaf.fill"); omit to leave unchanged
 
 ${_c_bld}Env:${_c_rst}
   GROVE_AGENT   command to launch (default: claude)
@@ -228,6 +359,7 @@ main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     go)            grove_go "$@" ;;
+    restyle)       grove_restyle "$@" ;;
     init)          grove_init "$@" ;;
     doctor)        grove_doctor "$@" ;;
     version|--version|-V) echo "grove v$GROVE_VERSION" ;;
@@ -235,4 +367,8 @@ main() {
     *) err "unknown command '$cmd'"; grove_usage; exit 1 ;;
   esac
 }
-main "$@"
+
+# Run only when executed, not when sourced (tests source for unit checks).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
