@@ -40,6 +40,16 @@ plumbing without any of that:
   - When finding a workspace id from `cmux workspace list`, match **`workspace:[0-9]+`** —
     do **not** take the first field, because the *selected* row is prefixed with `*`.
 
+## Git & PRs
+
+- Work on `feature/`/`fix/` branches; **multiple commits per branch are fine** — commit
+  freely as the work evolves, no need to squash locally.
+- **Always merge PRs with `gh pr merge --squash --delete-branch` (`-sd`).** The branch keeps
+  its full commit history on GitHub, but it lands on `main` as a *single, descriptive*
+  squash commit. Provide a squash **subject + body that describe the issue as a whole**
+  (not just the last commit) — write it explicitly with `-t`/`-b` (or in the editor), don't
+  accept GitHub's auto-generated concatenation of commit messages.
+
 ## Dependencies
 
 `wt` (worktrunk), the cmux CLI, `jq`, `claude`, `git`; `direnv` for the optional

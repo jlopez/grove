@@ -47,8 +47,9 @@ auto-detects it; override with `GROVE_CMUX`). Relevant JSON shapes:
 |---|---|---|
 | `workspace create … --json` | `{surface_ref, window_ref, workspace_ref}` | `.workspace_ref` |
 | `workspace-group create … --json` | `{group: {ref, anchor_workspace_ref, member_workspace_refs, …}}` | `.group.ref` |
-| `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs}]}` | `.groups[] | select(.name==…) | .ref` |
+| `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs, custom_color, icon_symbol}]}` | `.groups[] | select(.name==…) | .ref` |
 | `workspace-group add --group <ref> --workspace <ref>` | — | — |
+| `workspace-group set-color <g> --hex #RRGGBB` / `set-icon <g> --symbol <sf>` | — | — (styling; see below) |
 
 `workspace create` flags: `--cwd`, `--name`, `--command` (types text + Enter into the new
 shell), `--env KEY=VALUE`, `--env-file`, `--json`, `--focus`.
@@ -66,9 +67,77 @@ shell), `--env KEY=VALUE`, `--env-file`, `--json`, `--focus`.
   ungrouped). `workspace-group delete` is destructive — it closes every member. Use
   `ungroup` to keep them.
 - **`workspaceGroups.byCwd`** in `~/.config/cmux/cmux.json` is **declarative styling
-  only** (color/icon/placement), matched on a group's **anchor cwd**, longest match wins.
-  ⚠️ Keys **must be absolute paths** — `~` is expanded only for glob keys (containing
-  `*`/`?`), not plain prefix keys. `cmux reload-config` live-reloads without restart.
+  only**, matched on a group's **anchor cwd**, longest match wins. Per-group keys
+  (authoritative, from cmux's JSON schema): `color` (hex), `icon` (SF Symbol, default
+  `folder.fill`), `contextMenu` (custom items on the group's `+` right-click menu), and
+  `newWorkspacePlacement` (`afterCurrent`/`top`/`end`). ⚠️ Keys **must be absolute
+  paths** — `~` is expanded only for glob keys (containing `*`/`?`), not plain prefix
+  keys. `cmux reload-config` live-reloads without restart.
+
+### Group styling — the two stores and their precedence
+
+There are **two independent stores** for a group's color/icon, and grove relies on how
+they layer (all reverse-engineered + verified empirically):
+
+- **Imperative** — `cmux workspace-group set-color <g> --hex` / `set-icon <g> --symbol`.
+  Persists to cmux's **session state** (`~/Library/Application Support/cmux/session-*.json`),
+  on the group-header object keyed by `anchorWorkspaceId`. Surfaced in
+  `workspace-group list --json` as `custom_color` / `icon_symbol`. Does **not** write
+  `cmux.json`.
+- **Declarative** — `byCwd` in `cmux.json` (above).
+- **Precedence is per-attribute**: an imperatively-set attribute **wins**; `byCwd` fills
+  in only the attributes left unset. (cmux's own schema says `byCwd.color` applies "when
+  the group has no explicit customColor.") So imperative-red + `byCwd`-green/flame renders
+  **red + flame**; adding an imperative icon makes it **red + bolt**.
+- **Only `color` and `icon` are settable imperatively** — `contextMenu` and
+  `newWorkspacePlacement` are `byCwd`-only. That boundary defines grove's lane: grove
+  manages color/icon imperatively and never touches `cmux.json`; `byCwd` stays the user's
+  for context menus, placement, and umbrella folders.
+- **Durability:** imperative styling **survives a cmux restart** (session state restores
+  the anchor's UUID) but is **lost when the group is recreated** — closing the anchor
+  dissolves the group, and the next `grove go` mints a *new* anchor UUID, so the old
+  style is orphaned (verified: recreated group comes back `custom_color: null`). grove
+  closes this gap by re-applying style on every `go` (see below).
+
+### Per-repo group styling — `.grove.json`
+
+grove gives each repo's group a distinct, at-a-glance color (and optional icon) using the
+imperative store, reconciled from a per-repo source of truth so it survives group
+recreation:
+
+- **Source of truth: `<repo-root>/.grove.json`** — `{ "color"?, "icon"? }`, both optional,
+  parsed with `jq` (never sourced — no code execution from a cloned repo). Read from the
+  **root of the worktree grove is invoked in** (`git rev-parse --show-toplevel`), *not* the
+  main checkout. The group identity (name + anchor + the deterministic color) still keys off
+  the main checkout (`REPO`/`REPO_PATH`); only the override *file* is worktree-local. This is
+  deliberate: a main-checkout file can't be committed on your feature branch and dirties the
+  main checkout when written, whereas a worktree-local file is committable, takes effect
+  immediately, and matches how every other repo file (`.gitignore`, `package.json`) is read.
+  The shared group could in principle flap if two live worktrees carry *different uncommitted*
+  `.grove.json` — but it's a committed repo-identity file, so worktrees agree except while you
+  are editing it, which is exactly when you want that branch's preview. Commit it to share a
+  style; gitignore it to keep it personal/per-machine.
+- **Value semantics, per attribute** — both fully reconcile (removing a key reverts grove's
+  imperative state for it, so persistent styling lives in `.grove.json` or `byCwd`, never a
+  manual `cmux set-color`):
+  - `color`: `"#RRGGBB"` → explicit · **absent** (or `"auto"`) → **deterministic** ·
+    `"inherit"` → grove **clears** its imperative color so a `byCwd` umbrella shows through.
+  - `icon`: a symbol → explicit · **absent** → grove **clears** its imperative icon so the
+    `byCwd`/`folder.fill` default shows. No *deterministic* icon — auto-icons are noise; a
+    meaningful icon is the point — but absence still reconciles (it doesn't leave a stale one).
+- **Deterministic color** = a baked **48-cell OKLCH palette** (24 hues × 2 contrast-safe
+  lightness tiers, `L≈0.74/0.62 C≈0.13`), chosen offline so every color clears contrast on
+  light *and* dark sidebars; the repo name is hashed to a cell. OKLCH (not HSL) so all
+  cells share *perceived* contrast — varying hue in HSL would not. Collisions follow the
+  birthday bound, but what matters is clashes among *simultaneously-visible* groups (few),
+  and any clash is a one-line `.grove.json` override.
+- **Reconcile, don't set-once:** every `grove go` re-applies the resolved style (both the
+  create and the add path), so editing `.grove.json` takes effect on the next `go` and
+  group recreation self-heals. **`grove restyle`** is the no-spawn equivalent (operates on
+  the current repo's group); `grove restyle [--color #RRGGBB|auto|random|inherit]
+  [--icon <symbol>|none]` writes this worktree's `.grove.json` then applies, so JSON editing
+  is optional. `--color random` stamps a random palette hex (the picked color, never the word
+  "random"); `--icon none` drops the icon key.
 
 ### The "reversal" insight — no directory moves needed
 
@@ -135,6 +204,6 @@ generated `.envrc` gives every worktree the right account.
   worktrees — interrupting only for blocking questions. Buildable on `wt` + the cmux CLI
   (`wt merge` already does squash→rebase→merge→remove→hooks).
 - Keeping the default branch fresh (`pre-switch` fetch / `wt step prune`).
-- Per-repo group color/icon, `grove rm` teardown, graceful handling of existing branches.
+- `grove rm` teardown, graceful handling of existing branches.
 
 See the [issue tracker](https://github.com/jlopez/grove/issues) for the live backlog.
