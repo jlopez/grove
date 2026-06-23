@@ -59,6 +59,15 @@ Run `grove go` from inside a cmux tab — it spawns the new workspace into the s
 - adds a `wt go` alias so you can type `wt go <branch> <prompt>`,
 - with `--with-multi-account`, adds a worktrunk hook that gives each worktree the **same `gh` account as your main checkout** (see below).
 
+### Config
+
+grove reads a small layered config, low → high precedence: `~/.config/grove/config.json`
+(machine-wide) → `<repo>/.grove.json` (committed) → `<repo>/.grove.local.json` (gitignored,
+personal). Files deep-merge, last layer wins per key. Today this drives the per-repo group
+**color/icon** (`{ "color"?, "icon"? }` — `color` is `#RRGGBB`, `"auto"`, or `"inherit"`;
+`icon` is an SF Symbol); `grove restyle` can write `.grove.json` for you. `grove init`
+gitignores `.grove.local.json`.
+
 ### Multi-account `gh` in worktrees
 
 If you use [direnv](https://direnv.net) to switch `gh` accounts per directory (e.g. `export GH_CONFIG_DIR=…`), worktrees created outside those directories lose the account. `grove init --with-multi-account` installs a worktrunk `pre-start` hook that asks the **main checkout's** direnv what it resolves and writes a matching `.envrc` into each new worktree — no mapping tables, no drift. It's a no-op for repos that don't use direnv.

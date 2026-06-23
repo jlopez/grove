@@ -9,6 +9,14 @@ All notable changes to grove are documented here. Format follows
 ### Added
 - `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
   running Claude on the prompt, filed under the repo's sidebar group.
+- Layered config store — a single resolver all of grove reads through. Four layers,
+  low → high: `${XDG_CONFIG_HOME:-~/.config}/grove/config.json` (machine-wide),
+  `<repo-root>/.grove.json` (committed), `<repo-root>/.grove.local.json` (gitignored,
+  personal), and an optional per-keypath `ENV_VAR`. Files deep-merge with jq's `*`
+  (last layer wins per key, arrays included); missing files are skipped and an invalid
+  layer is warned about and skipped. Group color/icon now resolve through the store, so
+  they can be set in any layer. `grove init` gitignores `.grove.local.json` when run
+  inside a repo.
 - Per-repo group color/icon. Each repo's cmux group gets a deterministic, contrast-
   safe OKLCH color (hashed from the repo name) for at-a-glance scanning. Override via
   a `<repo-root>/.grove.json` (`{ "color"?, "icon"? }`) read from the worktree you run

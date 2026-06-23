@@ -105,8 +105,10 @@ grove gives each repo's group a distinct, at-a-glance color (and optional icon) 
 imperative store, reconciled from a per-repo source of truth so it survives group
 recreation:
 
-- **Source of truth: `<repo-root>/.grove.json`** — `{ "color"?, "icon"? }`, both optional,
-  parsed with `jq` (never sourced — no code execution from a cloned repo). Read from the
+- **Source of truth: the layered config store** (`color`/`icon` keys; see
+  [Configuration](#configuration--the-layered-store) below) — both optional, parsed with `jq`
+  (never sourced — no code execution from a cloned repo). In practice you set them in
+  `<repo-root>/.grove.json`, but any layer works. Read from the
   **root of the worktree grove is invoked in** (`git rev-parse --show-toplevel`), *not* the
   main checkout. The group identity (name + anchor + the deterministic color) still keys off
   the main checkout (`REPO`/`REPO_PATH`); only the override *file* is worktree-local. This is
@@ -146,6 +148,47 @@ do **not** need a shared parent folder. The main checkout can stay wherever it i
 any per-directory env intact), worktrees can live anywhere (e.g. a hidden
 `~/.worktrunk/worktrees/<repo>/<branch>`), and they still share one sidebar group because
 grove adds them explicitly.
+
+## Configuration — the layered store
+
+All of grove reads config through one resolver (`grove_config_load` / `grove_config_get`
+/ `grove_config_get_array` in `bin/grove`), rather than each feature doing its own `jq`.
+Four layers, **low → high precedence**:
+
+1. `${XDG_CONFIG_HOME:-~/.config}/grove/config.json` — machine-wide defaults.
+2. `<repo-root>/.grove.json` — committed, repo-shared (repo identity: color/icon, and
+   any shared agent defaults).
+3. `<repo-root>/.grove.local.json` — gitignored, personal per-repo overrides.
+4. a per-keypath **`ENV_VAR`** — applied at read time, **only** where a call site opts in.
+
+The repo-local files (2, 3) are read from the **root of the worktree grove is invoked in**
+(`git rev-parse --show-toplevel`) — the same rationale as the styling file before it: a
+worktree-local file is committable on your branch and takes effect immediately, instead of
+dirtying the main checkout. The `.grove.json` / `.grove.local.json` split mirrors the
+familiar `settings.json` / `settings.local.json` convention. `grove init` appends
+`.grove.local.json` to the repo's `.gitignore` when run inside a repo.
+
+### Merge — nearly free
+
+Files merge with a single jq deep-merge: `jq -s 'reduce .[] as $x ({}; . * $x)'`. jq's `*`
+operator **recurses into objects** and **replaces arrays/scalars**, which is exactly
+last-layer-wins *per key* (arrays included) — no custom merge code. Missing files are
+skipped; a file that isn't valid JSON is warned about and skipped, so one bad layer never
+breaks reads (matching the defensive style read it replaces). The merged blob is held in a
+single in-memory string (`GROVE_CONFIG_JSON`); reads `jq` into it.
+
+### Reading — env override per keypath, no central registry
+
+`grove_config_get <keypath> [ENV_VAR]` returns the scalar at a dotted keypath (e.g. `color`,
+`agent.command`). If `ENV_VAR` is passed **and** set to a non-empty value, it wins (highest
+precedence); omitting it means no env fallback. So the env-override "registry" is
+**distributed at call sites** — there is no central table to keep in sync. `grove_config_get_array
+<keypath>` emits an array's elements one per line, for `mapfile -t`.
+
+**First consumer:** group color/icon. `grove_resolve_style` reads `color`/`icon` through the
+store (replacing its bespoke per-file `jq`), so styling now resolves across all layers — e.g.
+a machine-wide default color in the XDG layer, a committed team color in `.grove.json`, a
+personal tweak in `.grove.local.json`. This proves the abstraction with a real second reader.
 
 ## worktrunk integration
 
