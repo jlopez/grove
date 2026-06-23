@@ -39,6 +39,36 @@ setup() {
   [[ "$output" == *"usage: grove go"* ]]
 }
 
+@test "go rejects an unknown option" {
+  run "$GROVE" go --frobnicate some-branch
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown option"* ]]
+}
+
+@test "go --base requires a value" {
+  run "$GROVE" go --base
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--base needs a ref"* ]]
+}
+
+@test "go -h prints the new usage with --base/--no-fetch" {
+  run "$GROVE" go -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--base"* ]]
+  [[ "$output" == *"--no-fetch"* ]]
+}
+
+@test "go accepts the --base=<ref> form (not rejected as an unknown option)" {
+  # Run from a non-git temp dir so it bails at repo-identity BEFORE touching wt
+  # or cmux — we only assert the parser CONSUMED --base=@ (didn't treat it as an
+  # unknown option or as a missing-value error), mirroring the restyle tests.
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" go --base=@ some-branch
+  [ "$status" -ne 0 ]                        # bails (no git repo / no cmux)
+  [[ "$output" != *"unknown option"* ]]      # =-form was parsed, not rejected
+  [[ "$output" != *"needs a ref"* ]]         # value was extracted, not missing
+}
+
 @test "doctor runs and reports sections" {
   run "$GROVE" doctor
   # status may be non-zero if deps are missing (expected in CI); just check output
@@ -355,6 +385,49 @@ JSON
   source "$GROVE"
   run grove_title_in_group '{ "groups": [] }' "$(_ws_json)" grove "grove"
   [ "$status" -ne 0 ]
+}
+
+# --- base resolution for new worktrees (issue #14) ---------------------------
+# grove_resolve_base sets GROVE_BASE_ARGS (an array) and never hard-fails. The
+# escape-hatch and no-origin paths need no network, so they're unit-testable.
+
+@test "resolve_base: --base escape hatch wins, no fetch attempted" {
+  set +eu
+  source "$GROVE"
+  # Run from a non-git temp dir: if it tried to fetch/detect it would error, but
+  # the explicit base must short-circuit before any git call.
+  cd "$BATS_TEST_TMPDIR"
+  grove_resolve_base "@" ""
+  [ "${#GROVE_BASE_ARGS[@]}" -eq 2 ]
+  [ "${GROVE_BASE_ARGS[0]}" = "--base" ]
+  [ "${GROVE_BASE_ARGS[1]}" = "@" ]
+}
+
+@test "resolve_base: no origin/HEAD → empty base args (graceful, lets wt default)" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/noremote"; mkdir -p "$d"
+  git -C "$d" init -q
+  cd "$d"
+  grove_resolve_base "" ""               # no remote → origin/HEAD unset
+  [ "${#GROVE_BASE_ARGS[@]}" -eq 0 ]
+}
+
+@test "resolve_base: --no-fetch branches from the local default without fetching" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/nofetch"; mkdir -p "$d"
+  git -C "$d" init -q -b main
+  git -C "$d" config user.email t@t; git -C "$d" config user.name t
+  git -C "$d" commit -q --allow-empty -m init
+  # Point origin at a bare clone and set origin/HEAD, so def resolves to 'main'.
+  local bare; bare="$BATS_TEST_TMPDIR/nofetch.git"; git init -q --bare "$bare"
+  git -C "$d" remote add origin "$bare"; git -C "$d" push -q origin main
+  git -C "$d" remote set-head origin main
+  cd "$d"
+  grove_resolve_base "" "1"              # --no-fetch
+  [ "${GROVE_BASE_ARGS[0]}" = "--base" ]
+  [ "${GROVE_BASE_ARGS[1]}" = "main" ]   # local ref, not origin/main
 }
 
 @test "resolve_style: .grove.local.json color overrides committed .grove.json" {

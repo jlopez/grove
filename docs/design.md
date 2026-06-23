@@ -39,6 +39,15 @@ whole dance.
    `wt switch <branch>` to **materialize** it; neither → `wt switch -c <branch>` to
    **create** both. `wt switch` fires any worktrunk `pre-start` hooks (e.g. the optional
    multi-account hook below). Plain `wt switch -c` without grove stays agent-less.
+   For the **create-both** case grove first picks a **fresh base** (issue #14):
+   `wt switch -c` would branch from the *local* default, which goes stale after a
+   squash-merge the local default never pulled. So grove detects the default branch
+   from `origin/HEAD` (no network), `git fetch origin <def>`es that one ref, and hands
+   `wt --base origin/<def>` — wt's earliest hook runs *after* the worktree exists, too
+   late to choose a base, so grove owns the fetch. `--base <ref>` overrides the base
+   (e.g. `@` = current HEAD) and `--no-fetch` stays offline; every failure (no
+   `origin/HEAD`, fetch failure) degrades gracefully to the local default rather than
+   hard-failing. Materialize/reuse have existing history → no base to choose, untouched.
    *Reuse intentionally skips `wt switch`*, so `pre-start` hooks don't re-run on an
    existing worktree — they're creation-time, and grove-created worktrees already ran
    them. (A worktree created by plain `wt switch` before grove existed, then reopened,
@@ -274,7 +283,9 @@ generated `.envrc` gives every worktree the right account.
   worktrees, runs to completion, merges PRs, refreshes the default branch, and removes
   worktrees — interrupting only for blocking questions. Buildable on `wt` + the cmux CLI
   (`wt merge` already does squash→rebase→merge→remove→hooks).
-- Keeping the default branch fresh (`pre-switch` fetch / `wt step prune`).
+- ~~Keeping the default branch fresh~~ — done at branch-creation time: new worktrees
+  branch from a freshly fetched `origin/<default>` (issue #14), so there's no need to
+  eagerly refresh the local default after every merge.
 - `grove rm` teardown, graceful handling of existing branches.
 
 See the [issue tracker](https://github.com/jlopez/grove/issues) for the live backlog.
