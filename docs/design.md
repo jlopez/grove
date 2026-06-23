@@ -190,6 +190,12 @@ store (replacing its bespoke per-file `jq`), so styling now resolves across all 
 a machine-wide default color in the XDG layer, a committed team color in `.grove.json`, a
 personal tweak in `.grove.local.json`. This proves the abstraction with a real second reader.
 
+**Second consumer:** the launched agent. `grove go` reads `agent.command` (the executable,
+default `claude`, with `GROVE_COMMAND` as its per-keypath env override) and the `agent.args`
+array, `printf %q`-quoting each token plus the prompt into the command cmux types. `grove
+doctor` resolves the same `agent.command` to decide which binary to probe, instead of a
+hardcoded `claude`.
+
 ## worktrunk integration
 
 - **Worktree location** is a template: `worktree-path = "~/.worktrunk/worktrees/{{ repo }}/{{ branch | sanitize }}"`.

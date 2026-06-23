@@ -113,6 +113,23 @@ grove_config_get_array() {
     | if ($v|type)=="array" then $v[] | tostring else empty end'
 }
 
+# grove_build_launch [prompt] — print the shell command cmux types into a new
+# workspace, from the loaded config: agent.command (GROVE_COMMAND overrides;
+# default claude) then the agent.args array, then the prompt if non-empty. Every
+# token is %q-quoted so args/prompt survive the shell verbatim and the prompt
+# lands as a single initial-prompt argument. Reads GROVE_CONFIG_JSON, so callers
+# must grove_config_load first.
+grove_build_launch() {
+  local prompt="${1:-}" cmd launch a
+  local args=()
+  cmd=$(grove_config_get "agent.command" GROVE_COMMAND); cmd=${cmd:-claude}
+  mapfile -t args < <(grove_config_get_array "agent.args")
+  launch=$(printf '%q' "$cmd")
+  for a in ${args[@]+"${args[@]}"}; do launch+=" $(printf '%q' "$a")"; done
+  [ -n "$prompt" ] && launch+=" $(printf '%q' "$prompt")"
+  printf '%s' "$launch"
+}
+
 # ---- group styling ----------------------------------------------------------
 # 48-cell OKLCH palette: 24 hues × 2 lightness tiers (L≈0.74 / 0.62, C≈0.13),
 # generated offline and gamut-fitted so every cell clears contrast on both light
@@ -231,14 +248,10 @@ grove_go() {
     '.[] | select(.branch==$b) | .path' | head -1)
   [ -n "$wtpath" ] || die "could not resolve worktree path for '$branch'"
 
-  # 3. Build the command cmux types into the new workspace's shell. Quote the
-  #    prompt so the agent receives it as a single initial-prompt argument.
-  local agent="${GROVE_AGENT:-claude}" launch
-  if [ -n "$prompt" ]; then
-    launch="$agent $(printf '%q' "$prompt")"
-  else
-    launch="$agent"
-  fi
+  # 3. Build the command cmux types into the new workspace's shell, from the
+  #    layered config (agent.command + agent.args), then the prompt.
+  grove_config_load "$WORKTREE_ROOT"
+  local launch; launch=$(grove_build_launch "$prompt")
 
   # 4. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
   local ws
@@ -329,13 +342,20 @@ grove_doctor() {
       ok=1
     fi
   }
+  # Resolve the agent command the same way grove go does (config + GROVE_COMMAND),
+  # loading the repo's config layers when run inside a worktree.
+  local agent_cmd
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && grove_config_load "$(git rev-parse --show-toplevel)"
+  agent_cmd=$(grove_config_get "agent.command" GROVE_COMMAND); agent_cmd=${agent_cmd:-claude}
+
   printf '%sgrove doctor%s (v%s)\n' "$_c_bld" "$_c_rst" "$GROVE_VERSION"
   printf '\n%sRequired:%s\n' "$_c_bld" "$_c_rst"
   _chk "worktrunk (wt)" "command -v wt"                 "brew install worktrunk"
   _chk "cmux CLI"        "grove_cmux"                    "install cmux.app from cmux.dev"
   _chk "jq"              "command -v jq"                  "brew install jq"
   _chk "git"             "command -v git"                "xcode-select --install"
-  _chk "claude"          "command -v ${GROVE_AGENT:-claude}" "install Claude Code"
+  _chk "agent ($agent_cmd)" "command -v $agent_cmd"      "install it (or set agent.command / GROVE_COMMAND)"
   printf '\n%sOptional:%s\n' "$_c_bld" "$_c_rst"
   _chk "direnv (multi-account)" "command -v direnv"       "brew install direnv"
   _chk "cmux Claude plugin"     "test -n \"\$(wt config show 2>/dev/null | grep -i 'Plugin installed')\"" \
@@ -462,8 +482,12 @@ ${_c_bld}Per-repo styling${_c_rst} (any of the layers above):
   icon:  an SF Symbol name (e.g. "leaf.fill"); omit to clear (use byCwd/default)
   restyle --color random stamps a random palette color; --icon none drops the icon
 
+${_c_bld}Per-repo agent${_c_rst} (any of the layers above):
+  agent.command  executable to launch (default: claude; env GROVE_COMMAND wins)
+  agent.args     array of argv tokens passed before the prompt (default: none)
+
 ${_c_bld}Env:${_c_rst}
-  GROVE_AGENT   command to launch (default: claude)
+  GROVE_COMMAND command to launch (overrides agent.command; default: claude)
   GROVE_CMUX    path to the cmux CLI (default: auto-detect)
 EOF
 }

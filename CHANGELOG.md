@@ -28,6 +28,11 @@ All notable changes to grove are documented here. Format follows
   write `.grove.json` for you (`--color random` stamps a random palette color). grove
   sets color/icon via cmux's imperative API and never writes `cmux.json`; `byCwd` stays
   yours for umbrellas.
+- Configurable agent invocation through the config store. `agent.command` (the
+  executable, default `claude`) and `agent.args` (an array of argv tokens passed
+  before the prompt) are read from any config layer; `grove go` quotes each token
+  with `printf %q`. `grove doctor` checks the resolved command rather than a
+  hardcoded `claude`.
 - `grove init [--with-multi-account]` — optional wiring: cmux Claude plugin,
   `wt go` alias, and an opt-in direnv multi-account hook.
 - `grove doctor` — dependency and wiring check.
