@@ -39,6 +39,10 @@ whole dance.
    `wt switch <branch>` to **materialize** it; neither → `wt switch -c <branch>` to
    **create** both. `wt switch` fires any worktrunk `pre-start` hooks (e.g. the optional
    multi-account hook below). Plain `wt switch -c` without grove stays agent-less.
+   *Reuse intentionally skips `wt switch`*, so `pre-start` hooks don't re-run on an
+   existing worktree — they're creation-time, and grove-created worktrees already ran
+   them. (A worktree created by plain `wt switch` before grove existed, then reopened,
+   won't retroactively get hook-written files like `.envrc`.)
 3. **Primary-checkout guard** — if the resolved path is the repo's main checkout (the
    group's anchor/header), stop: grove targets *linked* worktrees, not the header. Paths
    are canonicalized before comparison. Often redundant with `wt switch`'s own refusal,

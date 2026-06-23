@@ -234,15 +234,19 @@ grove_worktree_path() {
 # grove_title_in_group <groups-json> <workspaces-json> <repo> <branch> — exit 0
 # iff some member workspace of the cmux group named <repo> has title == <branch>.
 # Pure (only needs jq): the I/O lives in grove_branch_attached. Keys on the
-# workspace title — grove sets `--name <branch>` at create, so title == branch —
-# and is scoped to the repo group's members, so a same-named branch in another
-# repo's group never false-matches. No matching group → no members → exit 1.
+# workspace title — grove sets `--name <branch>` at create, so title == branch
+# (custom_title is matched too, belt-and-suspenders, in case title drifts) — and
+# is scoped to the repo group's members, so a same-named branch in another repo's
+# group never false-matches. Missing `.groups`/`.workspaces`/`member_workspace_refs`
+# fall back to `[]` so a shape change fails closed (exit 1), not on a jq error.
 grove_title_in_group() {
   printf '%s' "$2" | jq -e \
     --argjson groups "$1" --arg repo "$3" --arg branch "$4" '
-      [ $groups.groups[] | select(.name==$repo) ] as $g
+      [ (($groups.groups // [])[] | select(.name==$repo)) ] as $g
       | ($g[0].member_workspace_refs // []) as $members
-      | any(.workspaces[]; (.ref as $r | $members | index($r)) and .title == $branch)
+      | any((.workspaces // [])[];
+            (.ref as $r | $members | index($r))
+            and (.title == $branch or .custom_title == $branch))
     ' >/dev/null 2>&1
 }
 
@@ -280,19 +284,20 @@ grove_go() {
   #    existence (see issue #2). Worktree exists → reuse its path, no `wt switch`;
   #    branch exists but no worktree → materialize it; neither → create both.
   #    `wt switch` fires worktrunk pre-start hooks (e.g. multi-account).
-  local wtpath; wtpath=$(grove_worktree_path "$branch")
+  local wtpath
+  wtpath=$(grove_worktree_path "$branch") || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
   if [ -n "$wtpath" ]; then
     info "reusing existing worktree for '$branch'"
   elif git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$branch"; then
     info "branch '$branch' exists — materializing its worktree…"
     wt switch "$branch" --no-cd -y \
       || die "could not materialize worktree for existing branch '$branch'"
-    wtpath=$(grove_worktree_path "$branch")
+    wtpath=$(grove_worktree_path "$branch") || die "could not resolve worktree path for '$branch'"
   else
     info "creating worktree for '$branch'…"
     wt switch -c "$branch" --no-cd -y \
       || die "worktree creation failed for '$branch'"
-    wtpath=$(grove_worktree_path "$branch")
+    wtpath=$(grove_worktree_path "$branch") || die "could not resolve worktree path for '$branch'"
   fi
   [ -n "$wtpath" ] || die "could not resolve worktree path for '$branch'"
 

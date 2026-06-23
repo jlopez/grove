@@ -287,9 +287,9 @@ JSON
 _ws_json() {
   cat <<'JSON'
 { "workspaces": [
-  { "ref": "workspace:19", "title": "grove" },
-  { "ref": "workspace:34", "title": "fix/gh-2-reopen-workspace" },
-  { "ref": "workspace:50", "title": "feature/x" }
+  { "ref": "workspace:19", "title": "grove",                    "custom_title": "grove" },
+  { "ref": "workspace:34", "title": "fix/gh-2-reopen-workspace", "custom_title": "renamed-tab" },
+  { "ref": "workspace:50", "title": "feature/x",                "custom_title": "feature/x" }
 ] }
 JSON
 }
@@ -299,6 +299,40 @@ JSON
   source "$GROVE"
   run grove_title_in_group "$(_groups_json)" "$(_ws_json)" grove "fix/gh-2-reopen-workspace"
   [ "$status" -eq 0 ]
+}
+
+@test "title_in_group: matches a member at index 0 of member_workspace_refs" {
+  # jq-truthiness guard: index($r)==0 is truthy in jq, so an index-0 member
+  # must still match (workspace:19 is the first member ref of group 'grove').
+  set +eu
+  source "$GROVE"
+  run grove_title_in_group "$(_groups_json)" "$(_ws_json)" grove "grove"
+  [ "$status" -eq 0 ]
+}
+
+@test "title_in_group: matches on custom_title when title has drifted" {
+  # workspace:34's title is the branch but custom_title was renamed; the reverse
+  # case (custom_title == branch, title drifted) must also match.
+  set +eu
+  source "$GROVE"
+  local ws='{ "workspaces": [ { "ref": "workspace:34", "title": "claude", "custom_title": "fix/gh-2-reopen-workspace" } ] }'
+  run grove_title_in_group "$(_groups_json)" "$ws" grove "fix/gh-2-reopen-workspace"
+  [ "$status" -eq 0 ]
+}
+
+@test "title_in_group: missing member_workspace_refs → no match (fails closed)" {
+  set +eu
+  source "$GROVE"
+  local groups='{ "groups": [ { "name": "grove" } ] }'
+  run grove_title_in_group "$groups" "$(_ws_json)" grove "grove"
+  [ "$status" -ne 0 ]
+}
+
+@test "title_in_group: malformed listings (no keys) → no match, no jq crash" {
+  set +eu
+  source "$GROVE"
+  run grove_title_in_group '{}' '{}' grove "grove"
+  [ "$status" -ne 0 ]
 }
 
 @test "title_in_group: no match when no member has that title" {
