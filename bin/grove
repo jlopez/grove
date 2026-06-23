@@ -260,11 +260,62 @@ grove_branch_attached() {
   grove_title_in_group "$groups" "$workspaces" "$repo" "$branch"
 }
 
+# grove_resolve_base <opt-base> <opt-no-fetch> — set GROVE_BASE_ARGS (an array) to
+# the `--base <ref>` worktrunk should branch a brand-new worktree from, applying
+# freshness-by-default (issue #14). worktrunk's `wt switch -c` branches from the
+# *local* default, which goes stale after a squash-merge that the local default
+# never pulled; grove owns the fetch because wt's earliest hook runs after the
+# worktree exists — too late to pick a base. Precedence:
+#   1. explicit --base <ref> (escape hatch) wins, no fetch.
+#   2. else detect the default branch from origin/HEAD (no network); unless
+#      --no-fetch, fetch just that one ref and branch from fresh origin/<def>.
+# Every failure degrades gracefully — never hard-fails: no origin/HEAD → leave
+# GROVE_BASE_ARGS empty (wt picks its own default); fetch failure or --no-fetch →
+# warn and branch from the local default (may be stale).
+grove_resolve_base() {
+  local opt_base="$1" opt_no_fetch="$2" def
+  GROVE_BASE_ARGS=()
+  if [ -n "$opt_base" ]; then
+    GROVE_BASE_ARGS=(--base "$opt_base")
+    return
+  fi
+  def=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null) || def=""
+  def=${def#origin/}
+  if [ -z "$def" ]; then
+    warn "no origin/HEAD set — letting worktrunk pick the base (set it with 'git remote set-head origin -a')"
+    return
+  fi
+  if [ -n "$opt_no_fetch" ]; then
+    info "--no-fetch: branching '$def' without refreshing (may be stale)"
+    GROVE_BASE_ARGS=(--base "$def")
+  elif git fetch origin "$def" --quiet 2>/dev/null; then
+    GROVE_BASE_ARGS=(--base "origin/$def")
+  else
+    warn "could not fetch origin/$def — branching from local '$def' (may be stale)"
+    GROVE_BASE_ARGS=(--base "$def")
+  fi
+}
+
 # =============================================================================
-# grove go <branch> [prompt...]
+# grove go [--base <ref>] [--no-fetch] <branch> [prompt...]
 # =============================================================================
 grove_go() {
-  [ $# -ge 1 ] || die "usage: grove go <branch> [prompt...]"
+  # First real flag parsing in `grove go`: --base/--no-fetch are consumed before
+  # the <branch> positional; the first non-option (or `--`) ends option parsing,
+  # so a prompt that itself starts with `-` still works after the branch.
+  local opt_base="" opt_no_fetch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base)     [ $# -ge 2 ] || die "grove go: --base needs a ref"; opt_base="$2"; shift 2 ;;
+      --base=*)   opt_base="${1#--base=}"; shift ;;
+      --no-fetch) opt_no_fetch=1; shift ;;
+      -h|--help)  echo "usage: grove go [--base <ref>] [--no-fetch] <branch> [prompt...]"; return 0 ;;
+      --)         shift; break ;;
+      -*)         die "grove go: unknown option '$1'" ;;
+      *)          break ;;
+    esac
+  done
+  [ $# -ge 1 ] || die "usage: grove go [--base <ref>] [--no-fetch] <branch> [prompt...]"
   local branch="$1"; shift
   local prompt="${*:-}"
 
@@ -294,8 +345,12 @@ grove_go() {
       || die "could not materialize worktree for existing branch '$branch'"
     wtpath=$(grove_worktree_path "$branch") || die "could not resolve worktree path for '$branch'"
   else
+    # G0: brand-new branch. Resolve a fresh base (fetch origin/<def> by default)
+    # so the worktree doesn't start from a stale local default (issue #14). G1
+    # (materialize) and G2 (reuse) have existing history → no base to choose.
+    grove_resolve_base "$opt_base" "$opt_no_fetch"
     info "creating worktree for '$branch'…"
-    wt switch -c "$branch" --no-cd -y \
+    wt switch -c "$branch" ${GROVE_BASE_ARGS[@]+"${GROVE_BASE_ARGS[@]}"} --no-cd -y \
       || die "worktree creation failed for '$branch'"
     wtpath=$(grove_worktree_path "$branch") || die "could not resolve worktree path for '$branch'"
   fi
@@ -525,7 +580,11 @@ grove_usage() {
 ${_c_bld}grove${_c_rst} v$GROVE_VERSION — parallel Claude agents in worktrees, grouped in cmux
 
 ${_c_bld}Usage:${_c_rst}
-  grove go <branch> [prompt...]   Create a worktree + spawn a cmux Claude agent
+  grove go [--base <ref>] [--no-fetch] <branch> [prompt...]
+                                  Create a worktree + spawn a cmux Claude agent.
+                                  New branches fetch and branch from origin/<default>
+                                  by default; --base <ref> overrides the base (e.g.
+                                  @ for current HEAD), --no-fetch stays offline.
   grove restyle [--color C] [--icon S]   Re-apply this repo's group color/icon
   grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
   grove doctor                    Check dependencies and wiring

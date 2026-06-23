@@ -9,6 +9,15 @@ All notable changes to grove are documented here. Format follows
 ### Added
 - `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
   running Claude on the prompt, filed under the repo's sidebar group.
+- `grove go` now branches **brand-new** worktrees from a freshly fetched
+  `origin/<default>` instead of the stale local default (issue #14). It detects the
+  default branch from `origin/HEAD` (no network), fetches just that one ref, and hands
+  `wt --base origin/<default>` — so agents start from current code and PRs don't need
+  rebasing. Two new flags (grove go's first flag parsing): `--base <ref>` overrides the
+  base (e.g. `@` for current HEAD, or the local default when you have unpushed commits),
+  and `--no-fetch` stays offline. Materialize/reuse of existing branches is untouched
+  (they have history → no base to choose), and every failure (no `origin/HEAD`, fetch
+  failure) degrades gracefully to the local default rather than hard-failing.
 - `grove go` now **resolves-or-creates** the worktree instead of always running
   `wt switch -c` (which dead-ended on a branch/worktree that already existed,
   issue #2). Two orthogonal guards run first: a **fail-fast cmux gate** stops with
