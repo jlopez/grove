@@ -85,10 +85,12 @@ grove_config_load() {
   fi
 }
 
-# grove_config_get <keypath> [ENV_VAR] — print the scalar at <keypath> (dotted,
-# e.g. "color" or "agent.command") from the loaded config. If ENV_VAR is given
-# AND set to a non-empty value it wins (the per-keypath override). Absent → "".
-# Booleans/numbers are stringified; objects/arrays read as "" (use _get_array).
+# grove_config_get <keypath> [ENV_VAR] — print the scalar at <keypath> from the
+# loaded config. The keypath is dotted to descend into nested objects (e.g.
+# "color", "agent.command"); a key may not itself contain a literal ".". If
+# ENV_VAR is given AND set to a non-empty value it wins (the per-keypath
+# override). Absent → "". Booleans/numbers are stringified; objects/arrays read
+# as "" (use _get_array).
 grove_config_get() {
   local keypath="$1" envvar="${2:-}"
   if [ -n "$envvar" ]; then
