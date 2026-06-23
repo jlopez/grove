@@ -223,6 +223,39 @@ grove_write_style() {
   info "wrote $f"
 }
 
+# ---- worktree / cmux resolution ---------------------------------------------
+# grove_worktree_path <branch> — print the worktree path worktrunk has for
+# <branch>, or nothing if no worktree exists yet. Reads `wt list --format json`.
+grove_worktree_path() {
+  wt list --format json | jq -r --arg b "$1" \
+    '.[] | select(.branch==$b) | .path' | head -1
+}
+
+# grove_title_in_group <groups-json> <workspaces-json> <repo> <branch> — exit 0
+# iff some member workspace of the cmux group named <repo> has title == <branch>.
+# Pure (only needs jq): the I/O lives in grove_branch_attached. Keys on the
+# workspace title — grove sets `--name <branch>` at create, so title == branch —
+# and is scoped to the repo group's members, so a same-named branch in another
+# repo's group never false-matches. No matching group → no members → exit 1.
+grove_title_in_group() {
+  printf '%s' "$2" | jq -e \
+    --argjson groups "$1" --arg repo "$3" --arg branch "$4" '
+      [ $groups.groups[] | select(.name==$repo) ] as $g
+      | ($g[0].member_workspace_refs // []) as $members
+      | any(.workspaces[]; (.ref as $r | $members | index($r)) and .title == $branch)
+    ' >/dev/null 2>&1
+}
+
+# grove_branch_attached <cmux> <repo> <branch> — exit 0 iff a cmux workspace in
+# the repo's group is already attached to <branch> (see grove_title_in_group).
+# Fetches the two cmux listings, then delegates the match to the pure helper.
+grove_branch_attached() {
+  local cmux="$1" repo="$2" branch="$3" groups workspaces
+  groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)   || return 1
+  workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)     || return 1
+  grove_title_in_group "$groups" "$workspaces" "$repo" "$branch"
+}
+
 # =============================================================================
 # grove go <branch> [prompt...]
 # =============================================================================
@@ -237,30 +270,53 @@ grove_go() {
 
   grove_repo_identity
 
-  # 1. Create the worktree (fires worktrunk pre-start hooks, e.g. multi-account).
-  info "creating worktree for '$branch'…"
-  wt switch -c "$branch" --no-cd -y \
-    || die "worktree creation failed (does branch '$branch' already exist?)"
+  # 1. Fail-fast cmux gate (before touching git): if a workspace in this repo's
+  #    group is already attached to <branch>, stop — never spawn a duplicate.
+  if grove_branch_attached "$CMUX" "$REPO" "$branch"; then
+    die "a workspace is already attached to '$branch' — close it first, or pick another branch"
+  fi
 
-  # 2. Resolve the new worktree's path.
-  local wtpath
-  wtpath=$(wt list --format json | jq -r --arg b "$branch" \
-    '.[] | select(.branch==$b) | .path' | head -1)
+  # 2. Resolve-or-create the worktree (git). Three cases, by branch/worktree
+  #    existence (see issue #2). Worktree exists → reuse its path, no `wt switch`;
+  #    branch exists but no worktree → materialize it; neither → create both.
+  #    `wt switch` fires worktrunk pre-start hooks (e.g. multi-account).
+  local wtpath; wtpath=$(grove_worktree_path "$branch")
+  if [ -n "$wtpath" ]; then
+    info "reusing existing worktree for '$branch'"
+  elif git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$branch"; then
+    info "branch '$branch' exists — materializing its worktree…"
+    wt switch "$branch" --no-cd -y \
+      || die "could not materialize worktree for existing branch '$branch'"
+    wtpath=$(grove_worktree_path "$branch")
+  else
+    info "creating worktree for '$branch'…"
+    wt switch -c "$branch" --no-cd -y \
+      || die "worktree creation failed for '$branch'"
+    wtpath=$(grove_worktree_path "$branch")
+  fi
   [ -n "$wtpath" ] || die "could not resolve worktree path for '$branch'"
 
-  # 3. Build the command cmux types into the new workspace's shell, from the
+  # 3. Primary-checkout guard: never spawn into the group header (the repo's main
+  #    checkout, which grove anchors each group at). Compare canonicalized paths.
+  local canon_wt canon_repo
+  canon_wt=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_wt="$wtpath"
+  canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P) || canon_repo="$REPO_PATH"
+  [ "$canon_wt" != "$canon_repo" ] \
+    || die "'$branch' is the repo's primary checkout — grove targets linked worktrees"
+
+  # 4. Build the command cmux types into the new workspace's shell, from the
   #    layered config (agent.command + agent.args), then the prompt.
   grove_config_load "$WORKTREE_ROOT"
   local launch; launch=$(grove_build_launch "$prompt")
 
-  # 4. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
+  # 5. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
   local ws
   ws=$(CMUX_QUIET=1 "$CMUX" workspace create \
         --cwd "$wtpath" --name "$branch" --command "$launch" --json \
         | jq -r '.workspace_ref')
   { [ -n "$ws" ] && [ "$ws" != "null" ]; } || die "cmux workspace create failed"
 
-  # 5. File under the repo group; create it (anchor = main checkout) on first use.
+  # 6. File under the repo group; create it (anchor = main checkout) on first use.
   local gid
   gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
         | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
@@ -271,7 +327,7 @@ grove_go() {
             --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
   fi
 
-  # 6. Reconcile group styling from this worktree's .grove.json (deterministic
+  # 7. Reconcile group styling from this worktree's .grove.json (deterministic
   #    color by default).
   { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
     && grove_apply_style "$CMUX" "$gid" "$REPO" "$WORKTREE_ROOT"

@@ -9,6 +9,14 @@ All notable changes to grove are documented here. Format follows
 ### Added
 - `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
   running Claude on the prompt, filed under the repo's sidebar group.
+- `grove go` now **resolves-or-creates** the worktree instead of always running
+  `wt switch -c` (which dead-ended on a branch/worktree that already existed,
+  issue #2). Two orthogonal guards run first: a **fail-fast cmux gate** stops with
+  a clear message if a workspace in the repo's group is already attached to the
+  branch (keyed on workspace title, scoped to the group), and a **primary-checkout
+  guard** refuses to spawn into the group header (the repo's main checkout). The
+  worktree itself is then reused if present, materialized if the branch exists, or
+  created otherwise — so revisiting a branch reopens it rather than failing.
 - Layered config store — a single resolver all of grove reads through. Four layers,
   low → high: `${XDG_CONFIG_HOME:-~/.config}/grove/config.json` (machine-wide),
   `<repo-root>/.grove.json` (committed), `<repo-root>/.grove.local.json` (gitignored,

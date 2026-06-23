@@ -22,13 +22,30 @@ whole dance.
 
 `grove go <branch> <prompt>`:
 
-1. **Create the worktree** — `wt switch -c <branch> --no-cd -y`. This fires any
-   worktrunk `pre-start` hooks (e.g. the optional multi-account hook below). Plain
-   `wt switch -c` without grove stays agent-less.
-2. **Resolve the path** — `wt list --format json | jq '.[] | select(.branch==…) | .path'`.
-3. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command 'claude "<prompt>"' --json`.
+1. **Fail-fast cmux gate** (before touching git) — if a workspace in this repo's group
+   is already attached to `<branch>`, stop with a clear message. Two orthogonal axes
+   drive `grove go`: **cmux** (is a workspace attached?) and **git** (does the branch/
+   worktree exist?); they're independent, so the gate is checked first and on its own.
+   The match keys on the workspace **`title`** (grove sets `--name <branch>` at create,
+   so `title == branch`) and is **scoped to the repo group's members** — cross-reference
+   `workspace-group list --json` member refs against `workspace list --json` titles — so
+   a same-named branch in another repo's group never false-matches. No group yet → nothing
+   attached → proceed. *Limitation:* a manual right-click Rename mutates the title and
+   defeats the match (fails safe — you get the error, never a silent duplicate); the real
+   fix is a grove-owned workspace→branch map (issue #18).
+2. **Resolve-or-create the worktree** — by branch/worktree existence:
+   worktree exists (`wt list --format json` has a path) → **reuse** it, no `wt switch`;
+   branch exists (`git show-ref --verify refs/heads/<branch>`) but no worktree →
+   `wt switch <branch>` to **materialize** it; neither → `wt switch -c <branch>` to
+   **create** both. `wt switch` fires any worktrunk `pre-start` hooks (e.g. the optional
+   multi-account hook below). Plain `wt switch -c` without grove stays agent-less.
+3. **Primary-checkout guard** — if the resolved path is the repo's main checkout (the
+   group's anchor/header), stop: grove targets *linked* worktrees, not the header. Paths
+   are canonicalized before comparison. Often redundant with `wt switch`'s own refusal,
+   but a clean message beats a raw `wt` error.
+4. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command 'claude "<prompt>"' --json`.
    The prompt is shell-quoted so the agent receives it as a single initial-prompt arg.
-4. **File it under the repo group** — add to the existing group, or create it on first
+5. **File it under the repo group** — add to the existing group, or create it on first
    use with the **main checkout as the anchor/header**.
 
 ### Why cmux is drivable from a hook/alias
@@ -48,6 +65,7 @@ auto-detects it; override with `GROVE_CMUX`). Relevant JSON shapes:
 | `workspace create … --json` | `{surface_ref, window_ref, workspace_ref}` | `.workspace_ref` |
 | `workspace-group create … --json` | `{group: {ref, anchor_workspace_ref, member_workspace_refs, …}}` | `.group.ref` |
 | `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs, custom_color, icon_symbol}]}` | `.groups[] | select(.name==…) | .ref` |
+| `workspace list --json` | `{window_ref, workspaces: [{ref, title, custom_title, current_directory, …}]}` | member `ref` → `title`, for the attach gate (below) |
 | `workspace-group add --group <ref> --workspace <ref>` | — | — |
 | `workspace-group set-color <g> --hex #RRGGBB` / `set-icon <g> --symbol <sf>` | — | — (styling; see below) |
 
