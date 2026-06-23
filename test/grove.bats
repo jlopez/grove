@@ -4,6 +4,12 @@
 
 GROVE="${BATS_TEST_DIRNAME}/../bin/grove"
 
+# Isolate the machine-wide config layer so a real ~/.config/grove/config.json
+# on the dev box can't leak into config/style assertions.
+setup() {
+  export XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/xdg"
+}
+
 @test "version prints a version string" {
   run "$GROVE" version
   [ "$status" -eq 0 ]
@@ -164,4 +170,88 @@ GROVE="${BATS_TEST_DIRNAME}/../bin/grove"
   run "$GROVE" restyle --color chartreuse
   [ "$status" -ne 0 ]
   [[ "$output" == *"must be #RRGGBB"* ]]
+}
+
+# --- layered config store ----------------------------------------------------
+
+@test "config_get: absent keypath → empty; present scalar is read" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/cfg"; mkdir -p "$d"
+  printf '%s\n' '{ "color": "#ABCDEF" }' > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(grove_config_get color)" = "#ABCDEF" ]
+  [ -z "$(grove_config_get nope)" ]
+}
+
+@test "config_get: dotted keypath reads nested scalars" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/nested"; mkdir -p "$d"
+  printf '%s\n' '{ "agent": { "command": "claude" } }' > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(grove_config_get agent.command)" = "claude" ]
+}
+
+@test "config: .grove.local.json wins over .grove.json (last layer wins)" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/layer"; mkdir -p "$d"
+  printf '%s\n' '{ "color": "#111111", "icon": "leaf.fill" }' > "$d/.grove.json"
+  printf '%s\n' '{ "color": "#222222" }'                      > "$d/.grove.local.json"
+  grove_config_load "$d"
+  [ "$(grove_config_get color)" = "#222222" ]   # overridden by local
+  [ "$(grove_config_get icon)"  = "leaf.fill" ] # untouched key persists
+}
+
+@test "config: XDG layer is the lowest precedence" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/xdglayer"; mkdir -p "$d" "$XDG_CONFIG_HOME/grove"
+  printf '%s\n' '{ "color": "#000001", "icon": "globe" }' > "$XDG_CONFIG_HOME/grove/config.json"
+  printf '%s\n' '{ "color": "#000002" }'                  > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(grove_config_get color)" = "#000002" ]   # repo file beats machine default
+  [ "$(grove_config_get icon)"  = "globe" ]     # but XDG-only key still shows
+}
+
+@test "config_get: ENV_VAR override wins when set non-empty" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/env"; mkdir -p "$d"
+  printf '%s\n' '{ "agent": { "command": "claude" } }' > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(GROVE_AGENT=echo grove_config_get agent.command GROVE_AGENT)" = "echo" ]
+  [ "$(GROVE_AGENT=""   grove_config_get agent.command GROVE_AGENT)" = "claude" ]  # empty ⇒ no override
+}
+
+@test "config_get_array: emits elements; non-array → nothing" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/arr"; mkdir -p "$d"
+  printf '%s\n' '{ "args": ["--a", "--b"], "color": "#abcdef" }' > "$d/.grove.json"
+  grove_config_load "$d"
+  local got; got=$(grove_config_get_array args | tr '\n' ',')
+  [ "$got" = "--a,--b," ]
+  [ -z "$(grove_config_get_array color)" ]   # scalar ⇒ nothing
+}
+
+@test "config_load: invalid layer is skipped, valid layers still merge" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/badlayer"; mkdir -p "$d"
+  printf '%s\n' '{ not json'             > "$d/.grove.json"        # bad → skipped
+  printf '%s\n' '{ "color": "#cccccc" }' > "$d/.grove.local.json" # good → kept
+  grove_config_load "$d"
+  [ "$(grove_config_get color)" = "#cccccc" ]
+}
+
+@test "resolve_style: .grove.local.json color overrides committed .grove.json" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/styleover"; mkdir -p "$d"
+  printf '%s\n' '{ "color": "#111111" }' > "$d/.grove.json"
+  printf '%s\n' '{ "color": "#999999" }' > "$d/.grove.local.json"
+  grove_resolve_style "styleover" "$d"
+  [ "$STYLE_COLOR" = "#999999" ]
 }

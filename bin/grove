@@ -49,6 +49,68 @@ grove_repo_identity() {
   WORKTREE_ROOT=$(git rev-parse --show-toplevel)
 }
 
+# ---- layered config store ---------------------------------------------------
+# A single resolver all of grove reads through. Layers, low → high precedence:
+#   1. ${XDG_CONFIG_HOME:-~/.config}/grove/config.json  — machine-wide defaults
+#   2. <repo-root>/.grove.json                          — committed, repo-shared
+#   3. <repo-root>/.grove.local.json                    — gitignored, personal
+#   4. a per-keypath ENV_VAR                            — only where a caller opts in
+# Files are deep-merged with jq's `*`, which recurses into objects and *replaces*
+# arrays/scalars — exactly last-layer-wins per key. The env override (highest
+# precedence) is applied per keypath at read time; there is no central registry —
+# call sites pass the ENV_VAR they honor (see grove_config_get).
+GROVE_CONFIG_JSON='{}'
+
+# grove_config_load <repo-root> — merge the present config files (layers 1-3,
+# rooted at <repo-root> for the repo-local files) into GROVE_CONFIG_JSON. Missing
+# files are skipped; a file that isn't valid JSON is warned about and skipped
+# (matching the defensive read it replaces), so one bad layer never breaks reads.
+grove_config_load() {
+  local root="$1" f
+  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/grove/config.json"
+  local present=()
+  for f in "$xdg" "$root/.grove.json" "$root/.grove.local.json"; do
+    [ -f "$f" ] || continue
+    if jq -e . "$f" >/dev/null 2>&1; then
+      present+=("$f")
+    else
+      warn "$f is not valid JSON — skipping that config layer"
+    fi
+  done
+  if [ ${#present[@]} -eq 0 ]; then
+    GROVE_CONFIG_JSON='{}'
+  else
+    GROVE_CONFIG_JSON=$(jq -s 'reduce .[] as $x ({}; . * $x)' "${present[@]}") \
+      || GROVE_CONFIG_JSON='{}'
+  fi
+}
+
+# grove_config_get <keypath> [ENV_VAR] — print the scalar at <keypath> (dotted,
+# e.g. "color" or "agent.command") from the loaded config. If ENV_VAR is given
+# AND set to a non-empty value it wins (the per-keypath override). Absent → "".
+# Booleans/numbers are stringified; objects/arrays read as "" (use _get_array).
+grove_config_get() {
+  local keypath="$1" envvar="${2:-}"
+  if [ -n "$envvar" ]; then
+    local ev="${!envvar:-}"
+    [ -n "$ev" ] && { printf '%s\n' "$ev"; return; }
+  fi
+  printf '%s' "$GROVE_CONFIG_JSON" | jq -r --arg kp "$keypath" '
+    getpath($kp | split(".")) as $v
+    | if   $v == null          then ""
+      elif ($v|type)=="string" then $v
+      elif ($v|type)=="object" or ($v|type)=="array" then ""
+      else ($v|tostring) end'
+}
+
+# grove_config_get_array <keypath> — print each element of the array at <keypath>
+# on its own line, for `mapfile -t`. Absent or non-array → nothing.
+grove_config_get_array() {
+  printf '%s' "$GROVE_CONFIG_JSON" | jq -r --arg kp "$1" '
+    getpath($kp | split(".")) as $v
+    | if ($v|type)=="array" then $v[] | tostring else empty end'
+}
+
 # ---- group styling ----------------------------------------------------------
 # 48-cell OKLCH palette: 24 hues × 2 lightness tiers (L≈0.74 / 0.62, C≈0.13),
 # generated offline and gamut-fitted so every cell clears contrast on both light
@@ -90,25 +152,20 @@ grove_random_color() {
 # grove_resolve_style <repo> <style-root> — sets STYLE_COLOR / STYLE_ICON.
 #   STYLE_COLOR: "#RRGGBB" to apply, or "INHERIT" to clear (let byCwd/settings show).
 #   STYLE_ICON:  SF Symbol to apply, or "" to CLEAR (revert to byCwd/default icon).
-# Reads <style-root>/.grove.json: { "color"?, "icon"? }. color absent/"auto" →
-# deterministic; "inherit" → clear; "#RRGGBB" → explicit. icon absent → clear.
-# Both attributes fully reconcile: removing a key reverts grove's imperative
-# state for it, so persistent styling lives in .grove.json or byCwd.
+# Reads the layered config store rooted at <style-root> (see grove_config_load):
+# color absent/"auto" → deterministic; "inherit" → clear; "#RRGGBB" → explicit;
+# icon absent → clear. Both attributes fully reconcile: dropping a key reverts
+# grove's imperative state for it, so persistent styling lives in the config.
 grove_resolve_style() {
-  local repo="$1" f="$2/.grove.json" cval="" ival=""
-  if [ -f "$f" ]; then
-    if jq -e . "$f" >/dev/null 2>&1; then
-      cval=$(jq -r '.color // "auto"' "$f")
-      ival=$(jq -r 'if (.icon|type)=="string" then .icon else empty end' "$f")
-    else
-      warn ".grove.json is not valid JSON — falling back to a deterministic color"
-    fi
-  fi
+  local repo="$1" cval="" ival=""
+  grove_config_load "$2"
+  cval=$(grove_config_get "color")
+  ival=$(grove_config_get "icon")
   case "$cval" in
     ''|auto)  STYLE_COLOR=$(grove_color_for "$repo") ;;
     inherit)  STYLE_COLOR="INHERIT" ;;
     '#'[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) STYLE_COLOR="$cval" ;;
-    *)        warn ".grove.json color '$cval' invalid (want #RRGGBB | auto | inherit) — using deterministic"
+    *)        warn "config color '$cval' invalid (want #RRGGBB | auto | inherit) — using deterministic"
               STYLE_COLOR=$(grove_color_for "$repo") ;;
   esac
   STYLE_ICON="$ival"
@@ -359,6 +416,22 @@ TOML
     fi
   fi
 
+  # 4. Gitignore the personal config override, if run inside a repo. The
+  #    committed .grove.json is repo identity; .grove.local.json is per-machine.
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local top gi
+    top=$(git rev-parse --show-toplevel)
+    gi="$top/.gitignore"
+    if git -C "$top" check-ignore -q .grove.local.json; then
+      info ".grove.local.json already gitignored"
+    else
+      info "adding .grove.local.json to ${gi#"$top"/}"
+      # preserve a final newline: if the file lacks a trailing one, add it first
+      [ -s "$gi" ] && [ -n "$(tail -c1 "$gi")" ] && printf '\n' >> "$gi"
+      printf '%s\n' ".grove.local.json" >> "$gi"
+    fi
+  fi
+
   info "init complete — try: ${_c_bld}grove go feature/test draft a hello-world${_c_rst}"
   [ "$want_multi" = 1 ] || info "multi-account direnv inheritance available via ${_c_bld}grove init --with-multi-account${_c_rst}"
 }
@@ -375,8 +448,14 @@ ${_c_bld}Usage:${_c_rst}
   grove doctor                    Check dependencies and wiring
   grove version
 
-${_c_bld}Per-repo styling:${_c_rst}
-  <repo-root>/.grove.json = { "color"?, "icon"? }   (read from the worktree you run grove in)
+${_c_bld}Config (layered, low → high precedence):${_c_rst}
+  \${XDG_CONFIG_HOME:-~/.config}/grove/config.json   machine-wide defaults
+  <repo-root>/.grove.json                           committed, repo-shared
+  <repo-root>/.grove.local.json                     gitignored, personal
+  Files deep-merge (last layer wins per key). Repo files are read from the
+  worktree you run grove in, so styling is committable on your branch.
+
+${_c_bld}Per-repo styling${_c_rst} (any of the layers above):
   color: #RRGGBB | "auto" (deterministic from repo name) | "inherit" (clear)
   icon:  an SF Symbol name (e.g. "leaf.fill"); omit to clear (use byCwd/default)
   restyle --color random stamps a random palette color; --icon none drops the icon
