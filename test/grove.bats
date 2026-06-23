@@ -58,6 +58,17 @@ setup() {
   [[ "$output" == *"--no-fetch"* ]]
 }
 
+@test "go accepts the --base=<ref> form (not rejected as an unknown option)" {
+  # Run from a non-git temp dir so it bails at repo-identity BEFORE touching wt
+  # or cmux — we only assert the parser CONSUMED --base=@ (didn't treat it as an
+  # unknown option or as a missing-value error), mirroring the restyle tests.
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" go --base=@ some-branch
+  [ "$status" -ne 0 ]                        # bails (no git repo / no cmux)
+  [[ "$output" != *"unknown option"* ]]      # =-form was parsed, not rejected
+  [[ "$output" != *"needs a ref"* ]]         # value was extracted, not missing
+}
+
 @test "doctor runs and reports sections" {
   run "$GROVE" doctor
   # status may be non-zero if deps are missing (expected in CI); just check output
