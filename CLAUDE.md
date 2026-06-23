@@ -31,7 +31,7 @@ docs/design.md             # architecture + CLI internals
 Exercising `grove go` for real spawns cmux workspaces and launches agents. To test the
 plumbing without any of that:
 
-- **`GROVE_AGENT=echo grove go <branch> <words>`** — swaps `claude` for a benign command,
+- **`GROVE_COMMAND=echo grove go <branch> <words>`** — swaps `claude` for a benign command,
   so nothing real launches.
 - **Clean up surgically.** Close only the workspace you created and `wt remove --force`
   only your test branch. Two traps:

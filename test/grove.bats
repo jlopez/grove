@@ -221,8 +221,8 @@ setup() {
   local d; d="$BATS_TEST_TMPDIR/env"; mkdir -p "$d"
   printf '%s\n' '{ "agent": { "command": "claude" } }' > "$d/.grove.json"
   grove_config_load "$d"
-  [ "$(GROVE_AGENT=echo grove_config_get agent.command GROVE_AGENT)" = "echo" ]
-  [ "$(GROVE_AGENT=""   grove_config_get agent.command GROVE_AGENT)" = "claude" ]  # empty ⇒ no override
+  [ "$(GROVE_COMMAND=echo grove_config_get agent.command GROVE_COMMAND)" = "echo" ]
+  [ "$(GROVE_COMMAND=""   grove_config_get agent.command GROVE_COMMAND)" = "claude" ]  # empty ⇒ no override
 }
 
 @test "config_get_array: emits elements; non-array → nothing" {
@@ -234,6 +234,31 @@ setup() {
   local got; got=$(grove_config_get_array args | tr '\n' ',')
   [ "$got" = "--a,--b," ]
   [ -z "$(grove_config_get_array color)" ]   # scalar ⇒ nothing
+}
+
+@test "build_launch: default command, no args, no prompt" {
+  set +eu
+  source "$GROVE"
+  GROVE_CONFIG_JSON='{}'
+  [ "$(grove_build_launch)" = "claude" ]
+}
+
+@test "build_launch: command + args + prompt, each %q-quoted" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/launch"; mkdir -p "$d"
+  printf '%s\n' '{ "agent": { "command": "aider", "args": ["--model", "gpt 4"] } }' > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(grove_build_launch 'fix the bug')" = "aider --model gpt\\ 4 fix\\ the\\ bug" ]
+}
+
+@test "build_launch: GROVE_COMMAND overrides agent.command" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/launchenv"; mkdir -p "$d"
+  printf '%s\n' '{ "agent": { "command": "claude" } }' > "$d/.grove.json"
+  grove_config_load "$d"
+  [ "$(GROVE_COMMAND=echo grove_build_launch hi)" = "echo hi" ]
 }
 
 @test "config_load: invalid layer is skipped, valid layers still merge" {

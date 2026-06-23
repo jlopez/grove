@@ -63,9 +63,11 @@ Run `grove go` from inside a cmux tab — it spawns the new workspace into the s
 
 grove reads a small layered config, low → high precedence: `~/.config/grove/config.json`
 (machine-wide) → `<repo>/.grove.json` (committed) → `<repo>/.grove.local.json` (gitignored,
-personal). Files deep-merge, last layer wins per key. Today this drives the per-repo group
+personal). Files deep-merge, last layer wins per key. This drives the per-repo group
 **color/icon** (`{ "color"?, "icon"? }` — `color` is `#RRGGBB`, `"auto"`, or `"inherit"`;
-`icon` is an SF Symbol); `grove restyle` can write `.grove.json` for you. `grove init`
+`icon` is an SF Symbol); `grove restyle` can write `.grove.json` for you. It also drives the
+**agent** grove launches (`{ "agent": { "command"?, "args"? } }` — `command` defaults to
+`claude`, `args` is an array of argv tokens passed before the prompt). `grove init`
 gitignores `.grove.local.json`.
 
 ### Multi-account `gh` in worktrees
@@ -97,7 +99,7 @@ cmux is reachable because grove runs from a cmux tab and inherits `CMUX_*` env, 
 
 ### Env
 
-- `GROVE_AGENT` — command to launch instead of `claude` (handy for testing, e.g. `GROVE_AGENT=echo`).
+- `GROVE_COMMAND` — command to launch instead of `claude` (overrides `agent.command`; handy for testing, e.g. `GROVE_COMMAND=echo`).
 - `GROVE_CMUX` — path to the cmux CLI (default: auto-detect).
 
 ## License
