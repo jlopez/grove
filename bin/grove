@@ -260,6 +260,34 @@ grove_branch_attached() {
   grove_title_in_group "$groups" "$workspaces" "$repo" "$branch"
 }
 
+# grove_ref_in_group <groups-json> <workspaces-json> <repo> <branch> — print the
+# ref of the member workspace of cmux group <repo> whose title == <branch> (or
+# custom_title, belt-and-suspenders), or nothing. The value-returning sibling of
+# grove_title_in_group (same scoping + fail-closed defaults), used by `grove rm`
+# to find the tab to close. `first(...)` stops at the first match; `// empty`
+# prints nothing when none matches, so a missing/renamed tab yields "".
+grove_ref_in_group() {
+  printf '%s' "$2" | jq -r \
+    --argjson groups "$1" --arg repo "$3" --arg branch "$4" '
+      [ (($groups.groups // [])[] | select(.name==$repo)) ] as $g
+      | ($g[0].member_workspace_refs // []) as $members
+      | first((.workspaces // [])[]
+              | select((.ref as $r | $members | index($r))
+                       and (.title == $branch or .custom_title == $branch))
+              | .ref) // empty
+    ' 2>/dev/null
+}
+
+# grove_attached_workspace_ref <cmux> <repo> <branch> — print the ref of the cmux
+# workspace in the repo's group attached to <branch>, or nothing. Fetches the two
+# listings (as grove_branch_attached does), then delegates to the pure matcher.
+grove_attached_workspace_ref() {
+  local cmux="$1" repo="$2" branch="$3" groups workspaces
+  groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)   || return 1
+  workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)     || return 1
+  grove_ref_in_group "$groups" "$workspaces" "$repo" "$branch"
+}
+
 # grove_resolve_base <opt-base> <opt-no-fetch> — set GROVE_BASE_ARGS (an array) to
 # the `--base <ref>` worktrunk should branch a brand-new worktree from, applying
 # freshness-by-default (issue #14). worktrunk's `wt switch -c` branches from the
@@ -395,6 +423,83 @@ grove_go() {
   CMUX_QUIET=1 "$CMUX" workspace select "$ws" >/dev/null 2>&1 || true
   info "spawned ${_c_bld}$ws${_c_rst} ($branch) under group '${_c_bld}$REPO${_c_rst}'"
   printf '%s\n' "$wtpath"
+}
+
+# =============================================================================
+# grove rm [--force] [--keep-branch] [--reap] [<branch>]
+# The inverse of `grove go`: close the cmux workspace attached to <branch> and
+# remove its worktree. grove owns the workspace↔branch bridge (nobody else knows
+# it), so it closes the tab `wt remove`/`wt merge` would otherwise strand; the
+# git side is delegated to `wt remove`, which is safe by default — it refuses a
+# dirty worktree without --force and deletes the branch only when it's merged.
+# =============================================================================
+grove_rm() {
+  local opt_force="" opt_keep="" opt_reap="" branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force)    opt_force=1; shift ;;
+      --keep-branch) opt_keep=1; shift ;;
+      --reap)        opt_reap=1; shift ;;
+      -h|--help)     echo "usage: grove rm [--force] [--keep-branch] [--reap] [<branch>]"; return 0 ;;
+      --)            shift; [ $# -gt 0 ] && branch="$1"; break ;;
+      -*)            die "grove rm: unknown option '$1'" ;;
+      *)             branch="$1"; break ;;
+    esac
+  done
+
+  command -v wt >/dev/null 2>&1 || die "worktrunk (wt) not found — see 'grove doctor'"
+  command -v jq >/dev/null 2>&1 || die "jq not found — see 'grove doctor'"
+  local CMUX; CMUX=$(grove_cmux) || die "cmux CLI not found — see 'grove doctor'"
+
+  grove_repo_identity
+
+  # Default to the current worktree's branch (matches `wt remove`'s "current"
+  # default) — so `grove rm` from inside the worktree you're done with just works.
+  if [ -z "$branch" ]; then
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+    { [ -n "$branch" ] && [ "$branch" != "HEAD" ]; } \
+      || die "grove rm: no <branch> given and couldn't detect the current branch"
+  fi
+
+  # Primary-checkout guard: never tear down the repo's main checkout (the group's
+  # anchor/header). Compare canonicalized paths, as `grove go` does. Removing a
+  # *member* leaves the group intact; only closing the anchor dissolves it.
+  local wtpath canon_wt canon_repo
+  wtpath=$(grove_worktree_path "$branch") || wtpath=""
+  if [ -n "$wtpath" ]; then
+    canon_wt=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_wt="$wtpath"
+    canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P) || canon_repo="$REPO_PATH"
+    [ "$canon_wt" != "$canon_repo" ] \
+      || die "'$branch' is the repo's primary checkout — grove rm targets linked worktrees"
+  fi
+
+  # 1. Close the cmux workspace attached to <branch>, if any — first, so no shell
+  #    is left cwd'd inside a directory we're about to remove. A missing/renamed
+  #    tab just yields no ref (fails safe); the worktree removal still proceeds.
+  local ws
+  ws=$(grove_attached_workspace_ref "$CMUX" "$REPO" "$branch") || ws=""
+  if [ -n "$ws" ]; then
+    info "closing workspace ${_c_bld}$ws${_c_rst} ($branch)…"
+    CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
+      || warn "could not close workspace $ws (already gone?)"
+  else
+    info "no cmux workspace attached to '$branch'"
+  fi
+
+  # 2. Remove the worktree (git), delegating to wt's safe defaults. If there's no
+  #    worktree, we're done — the tab (if any) is already closed.
+  if [ -z "$wtpath" ]; then
+    info "no worktree for '$branch' — nothing more to remove"
+    return 0
+  fi
+  local rm_args=("$branch")
+  [ -n "$opt_force" ] && rm_args+=(--force)
+  [ -n "$opt_keep" ]  && rm_args+=(--no-delete-branch)
+  [ -n "$opt_reap" ]  && rm_args+=(--reap)
+  info "removing worktree for '$branch'…"
+  wt remove "${rm_args[@]}" \
+    || die "worktree removal failed for '$branch' (dirty tree? re-run 'grove rm --force')"
+  info "removed worktree for ${_c_bld}$branch${_c_rst}"
 }
 
 # =============================================================================
@@ -585,6 +690,12 @@ ${_c_bld}Usage:${_c_rst}
                                   New branches fetch and branch from origin/<default>
                                   by default; --base <ref> overrides the base (e.g.
                                   @ for current HEAD), --no-fetch stays offline.
+  grove rm [--force] [--keep-branch] [--reap] [<branch>]
+                                  Tear down a worktree you're done with: close its
+                                  cmux workspace and 'wt remove' the worktree
+                                  (defaults to the current branch). Safe by default —
+                                  refuses a dirty tree without --force, and deletes
+                                  the branch only if merged (--keep-branch to keep it).
   grove restyle [--color C] [--icon S]   Re-apply this repo's group color/icon
   grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
   grove doctor                    Check dependencies and wiring
@@ -616,6 +727,7 @@ main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     go)            grove_go "$@" ;;
+    rm)            grove_rm "$@" ;;
     restyle)       grove_restyle "$@" ;;
     init)          grove_init "$@" ;;
     doctor)        grove_doctor "$@" ;;

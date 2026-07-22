@@ -44,6 +44,8 @@ This drops `grove` into `~/.local/bin`. Then `grove init` wires the optional bit
 
 ```
 grove go <branch> [prompt...]        Create a worktree + spawn a cmux Claude agent
+grove rm [--force] [<branch>]        Done with a feature: close its cmux tab +
+                                     remove the worktree (defaults to current branch)
 grove init [--with-multi-account]    Optional wiring (wt alias, cmux plugin, direnv)
 grove doctor                         Check dependencies and wiring
 grove version

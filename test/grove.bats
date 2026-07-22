@@ -69,6 +69,24 @@ setup() {
   [[ "$output" != *"needs a ref"* ]]         # value was extracted, not missing
 }
 
+@test "rm -h prints usage" {
+  run "$GROVE" rm -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"usage: grove rm"* ]]
+}
+
+@test "rm rejects an unknown option" {
+  run "$GROVE" rm --frobnicate
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown option"* ]]
+}
+
+@test "help documents grove rm teardown" {
+  run "$GROVE" help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"grove rm"* ]]
+}
+
 @test "doctor runs and reports sections" {
   run "$GROVE" doctor
   # status may be non-zero if deps are missing (expected in CI); just check output
@@ -385,6 +403,44 @@ JSON
   source "$GROVE"
   run grove_title_in_group '{ "groups": [] }' "$(_ws_json)" grove "grove"
   [ "$status" -ne 0 ]
+}
+
+# grove_ref_in_group is the value-returning sibling used by `grove rm` to find
+# the tab to close; it prints the matched member's ref (or nothing), reusing the
+# same fixtures/scoping as title_in_group above.
+
+@test "ref_in_group: returns the ref of the matched member workspace" {
+  set +eu
+  source "$GROVE"
+  local r; r=$(grove_ref_in_group "$(_groups_json)" "$(_ws_json)" grove "fix/gh-2-reopen-workspace")
+  [ "$r" = "workspace:34" ]
+}
+
+@test "ref_in_group: matches on custom_title when title has drifted" {
+  set +eu
+  source "$GROVE"
+  local ws='{ "workspaces": [ { "ref": "workspace:34", "title": "claude", "custom_title": "fix/gh-2-reopen-workspace" } ] }'
+  local r; r=$(grove_ref_in_group "$(_groups_json)" "$ws" grove "fix/gh-2-reopen-workspace")
+  [ "$r" = "workspace:34" ]
+}
+
+@test "ref_in_group: no match → empty (missing/renamed tab is safe to skip)" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_ref_in_group "$(_groups_json)" "$(_ws_json)" grove "feature/nope")" ]
+}
+
+@test "ref_in_group: scoped to the repo group (cross-repo same name → empty)" {
+  set +eu
+  source "$GROVE"
+  # 'feature/x' is attached only in the 'other' group, not in 'grove'.
+  [ -z "$(grove_ref_in_group "$(_groups_json)" "$(_ws_json)" grove "feature/x")" ]
+}
+
+@test "ref_in_group: malformed listings → empty, no jq crash" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_ref_in_group '{}' '{}' grove "grove")" ]
 }
 
 # --- base resolution for new worktrees (issue #14) ---------------------------
