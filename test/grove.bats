@@ -87,6 +87,23 @@ setup() {
   [[ "$output" == *"grove rm"* ]]
 }
 
+@test "rm rejects a second positional argument (doesn't silently drop trailing tokens)" {
+  run "$GROVE" rm feature/x extra
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected argument"* ]]
+}
+
+@test "rm accepts a flag after the branch (doesn't drop a post-branch --force)" {
+  # The parser must not stop at the first positional: `grove rm <branch> --force`
+  # must honor --force, not drop it. Run from a non-git tmpdir so it's the PARSER
+  # under test — it bails later at repo-identity, but must not reject the flag.
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" rm feature/x --force
+  [ "$status" -ne 0 ]                        # bails (no git repo / no deps)
+  [[ "$output" != *"unexpected argument"* ]] # branch + trailing flag both parsed
+  [[ "$output" != *"unknown option"* ]]
+}
+
 @test "doctor runs and reports sections" {
   run "$GROVE" doctor
   # status may be non-zero if deps are missing (expected in CI); just check output

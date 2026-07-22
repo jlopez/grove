@@ -10,12 +10,14 @@ All notable changes to grove are documented here. Format follows
 - `grove rm [--force] [--keep-branch] [--reap] [<branch>]` — the inverse of
   `grove go`: tear down a worktree you're done with. grove owns the workspace↔branch
   bridge nobody else knows, so it closes the cmux tab that `wt remove`/`wt merge`
-  would otherwise strand, then delegates the git side to `wt remove`. It defaults to
-  the current worktree's branch, guards the primary checkout (never dissolves the
-  group), and closes the tab *before* removing the worktree so no shell is left
-  cwd'd in a vanishing directory. Safe by default via `wt`: it refuses a dirty tree
-  without `--force` and deletes the branch only when merged (`--keep-branch` maps to
-  `wt remove --no-delete-branch`; `--reap` kills stray processes in the worktree).
+  would otherwise strand, then delegates the git side to `wt remove -y`. It defaults
+  to the current worktree's branch and guards the primary checkout (never dissolves
+  the group). It **removes the worktree first, then closes the tab** — so running it
+  from inside the worktree's own tab can't kill grove before the removal runs. Safe
+  by default via `wt`: it refuses a dirty tree without `--force` and deletes the
+  branch only when merged (`--keep-branch` maps to `wt remove --no-delete-branch`;
+  `--reap` kills stray processes in the worktree; `-y` skips only worktrunk's
+  hook-approval prompts, matching `grove go`).
 - `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
   running Claude on the prompt, filed under the repo's sidebar group.
 - `grove go` now branches **brand-new** worktrees from a freshly fetched

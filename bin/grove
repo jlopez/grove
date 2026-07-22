@@ -435,15 +435,24 @@ grove_go() {
 # =============================================================================
 grove_rm() {
   local opt_force="" opt_keep="" opt_reap="" branch=""
+  # Unlike `grove go` (whose trailing tokens are the prompt), `grove rm` has no
+  # free-form tail — so flags may appear in any position and a second positional
+  # is a mistake we reject, rather than silently dropping a post-branch --force
+  # (which would then be re-suggested by the failure hint — a confusing loop).
   while [ $# -gt 0 ]; do
     case "$1" in
       -f|--force)    opt_force=1; shift ;;
       --keep-branch) opt_keep=1; shift ;;
       --reap)        opt_reap=1; shift ;;
       -h|--help)     echo "usage: grove rm [--force] [--keep-branch] [--reap] [<branch>]"; return 0 ;;
-      --)            shift; [ $# -gt 0 ] && branch="$1"; break ;;
+      --)            shift
+                     while [ $# -gt 0 ]; do
+                       [ -z "$branch" ] || die "grove rm: unexpected argument '$1'"
+                       branch="$1"; shift
+                     done ;;
       -*)            die "grove rm: unknown option '$1'" ;;
-      *)             branch="$1"; break ;;
+      *)             [ -z "$branch" ] || die "grove rm: unexpected argument '$1'"
+                     branch="$1"; shift ;;
     esac
   done
 
@@ -473,9 +482,32 @@ grove_rm() {
       || die "'$branch' is the repo's primary checkout — grove rm targets linked worktrees"
   fi
 
-  # 1. Close the cmux workspace attached to <branch>, if any — first, so no shell
-  #    is left cwd'd inside a directory we're about to remove. A missing/renamed
-  #    tab just yields no ref (fails safe); the worktree removal still proceeds.
+  # 1. Remove the worktree (git) FIRST, delegating to wt's safe defaults (it
+  #    refuses a dirty tree without --force and deletes the branch only when
+  #    merged). Removal must precede the tab close: `grove rm` is often run from
+  #    inside the very worktree's own tab, and closing that tab first could kill
+  #    grove before `wt remove` ran — the inverse of the command's purpose. wt
+  #    renames the worktree out and deletes the branch synchronously (only the
+  #    final rm -rf is detached), so this returns once the outcome — success or a
+  #    dirty-tree refusal — is known. `-y` skips worktrunk's hook-approval prompts
+  #    (as `grove go` does on `wt switch`), so a repo with pre-remove hooks doesn't
+  #    hang non-interactively.
+  if [ -n "$wtpath" ]; then
+    local rm_args=("$branch" -y)
+    [ -n "$opt_force" ] && rm_args+=(--force)
+    [ -n "$opt_keep" ]  && rm_args+=(--no-delete-branch)
+    [ -n "$opt_reap" ]  && rm_args+=(--reap)
+    info "removing worktree for '$branch'…"
+    wt remove "${rm_args[@]}" \
+      || die "worktree removal failed for '$branch' (dirty tree? re-run 'grove rm --force')"
+    info "removed worktree for ${_c_bld}$branch${_c_rst}"
+  else
+    info "no worktree for '$branch'"
+  fi
+
+  # 2. Close the cmux workspace attached to <branch>, if any — LAST, so closing
+  #    grove's own tab can't abort the removal above. A missing/renamed tab just
+  #    yields no ref (fails safe), leaving nothing to close.
   local ws
   ws=$(grove_attached_workspace_ref "$CMUX" "$REPO" "$branch") || ws=""
   if [ -n "$ws" ]; then
@@ -485,21 +517,6 @@ grove_rm() {
   else
     info "no cmux workspace attached to '$branch'"
   fi
-
-  # 2. Remove the worktree (git), delegating to wt's safe defaults. If there's no
-  #    worktree, we're done — the tab (if any) is already closed.
-  if [ -z "$wtpath" ]; then
-    info "no worktree for '$branch' — nothing more to remove"
-    return 0
-  fi
-  local rm_args=("$branch")
-  [ -n "$opt_force" ] && rm_args+=(--force)
-  [ -n "$opt_keep" ]  && rm_args+=(--no-delete-branch)
-  [ -n "$opt_reap" ]  && rm_args+=(--reap)
-  info "removing worktree for '$branch'…"
-  wt remove "${rm_args[@]}" \
-    || die "worktree removal failed for '$branch' (dirty tree? re-run 'grove rm --force')"
-  info "removed worktree for ${_c_bld}$branch${_c_rst}"
 }
 
 # =============================================================================

@@ -83,22 +83,30 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
    group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
    leaves the group intact — only closing the **anchor** dissolves it — so teardown never
    collapses the sidebar group out from under your other worktrees.
-3. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
-   the ref (the value-returning sibling of the gate's boolean matcher), then `cmux workspace
-   close <ref>`. Done **first**, so no shell is left cwd'd inside a directory about to vanish. A
-   missing or manually-renamed tab yields no ref and is skipped (fails safe) — removal still
-   proceeds.
-4. **Remove the worktree** — delegate to `wt remove <branch>`, which is **safe by default**:
+3. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
    it *"Remove[s the] worktree; delete[s the] branch if merged"*, and **refuses a dirty
-   worktree** without `-f`. grove forwards `--force` → `wt --force` (also needed for the
-   untracked-`.envrc` wrinkle above), `--keep-branch` → `wt --no-delete-branch`, and `--reap`
-   → `wt --reap` (kill stray dev servers/watchers in the worktree). No worktree for the branch
-   → nothing to remove; the tab (if any) is already closed.
+   worktree** without `-f`. This runs **before** the tab is closed (step 4): `grove rm` is meant
+   to be run from inside the worktree's *own* tab, and closing that tab first could kill `grove`
+   before `wt remove` ran — the inverse of the command's purpose. wt renames the worktree out and
+   deletes the branch synchronously (only the final `rm -rf` is detached — *"Removal runs in the
+   background by default"*), so the call returns once the outcome (success or a dirty-tree
+   refusal) is known. `-y` skips worktrunk's **hook-approval** prompts — as `grove go` does on
+   `wt switch` — so a repo with `pre-remove` hooks doesn't hang non-interactively (it does *not*
+   bypass the dirty-tree refusal, which is a hard `--force` gate, not a prompt). grove forwards
+   `--force` → `wt --force` (also needed for the untracked-`.envrc` wrinkle above),
+   `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
+   servers/watchers under the worktree before removal). No worktree for the branch → nothing to
+   remove.
+4. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
+   the ref (the value-returning sibling of the gate's boolean matcher), then `cmux workspace
+   close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal above. A
+   missing or manually-renamed tab yields no ref and is skipped (fails safe).
 
-Because the safety lives in `wt` (dirty-tree refusal, merged-only branch deletion), `grove rm`
-needs no confirmation prompt of its own — it stays as non-interactive as `grove go`. For the
-**merged-and-done** case, `wt merge` (squash→rebase→ff→remove) and `grove rm` compose: merge
-with `wt`, then `grove rm` closes the now-orphaned tab (and no-ops the already-gone worktree).
+Because the safety lives in `wt` (dirty-tree refusal, merged-only branch deletion) and `-y`
+suppresses only *approval* prompts, `grove rm` needs no confirmation prompt of its own — it
+stays as non-interactive as `grove go`. For the **merged-and-done** case, `wt merge`
+(squash→rebase→ff→remove) and `grove rm` compose: merge with `wt`, then `grove rm` closes the
+now-orphaned tab (and no-ops the already-gone worktree).
 
 ## cmux CLI contract (reverse-engineered)
 
