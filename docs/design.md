@@ -68,6 +68,65 @@ Those `CMUX_*` env vars (`CMUX_WORKSPACE_ID`, `CMUX_SOCKET_PATH`, …) are prese
 shell inside a cmux workspace, and subprocesses inherit them — so a command run from a
 cmux tab can drive cmux back into the same window. Run `grove go` from a cmux tab.
 
+## The `grove rm` flow
+
+`grove rm [<branch>]` is the **inverse of `grove go`** — the teardown for when you're done
+with a feature. It exists because grove owns a bridge nobody else does: the
+**workspace↔branch mapping**. `wt remove` and `wt merge` both know how to drop the *worktree*,
+but they leave the *cmux tab* dangling — only grove knows which tab is attached to which
+branch (the same title-match that powers the `grove go` gate). So `grove rm`:
+
+1. **Resolve the target branch** — the argument, or the current worktree's branch if omitted
+   (mirroring `wt remove`'s "current" default), so `grove rm` from inside the worktree you're
+   finished with just works.
+2. **Primary-checkout guard** — refuse if the branch resolves to the repo's main checkout (the
+   group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
+   leaves the group intact — only closing the **anchor** dissolves it — so teardown never
+   collapses the sidebar group out from under your other worktrees.
+3. **Refresh the merge baseline** — fetch just `origin/<default>` (the teardown mirror of
+   issue #14's freshness-by-default). `wt`'s merged-branch checks compare against
+   `origin/<default>` *as last fetched*, so run right after `gh pr merge -sd` a stale ref would
+   make the just-squash-merged branch look unmerged and leak it. `--no-fetch` opts out; a
+   failed fetch warns and proceeds (worst case the branch is kept, never lost).
+4. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
+   it *"Remove[s the] worktree; delete[s the] branch if merged"*, and **refuses a dirty
+   worktree** without `-f`. This runs **before** the tab is closed (step 4): `grove rm` is meant
+   to be run from inside the worktree's *own* tab, and closing that tab first could kill `grove`
+   before `wt remove` ran — the inverse of the command's purpose. wt renames the worktree out and
+   deletes the branch synchronously (only the final `rm -rf` is detached — *"Removal runs in the
+   background by default"*), so the call returns once the outcome (success or a dirty-tree
+   refusal) is known. `-y` skips worktrunk's **hook-approval** prompts — as `grove go` does on
+   `wt switch` — so a repo with `pre-remove` hooks doesn't hang non-interactively (it does *not*
+   bypass the dirty-tree refusal, which is a hard `--force` gate, not a prompt). grove forwards
+   `--force` → `wt --force` (also needed for the untracked-`.envrc` wrinkle above),
+   `-D`/`--force-delete` → `wt --force-delete` (delete a genuinely unmerged branch — also
+   needed when a squash merge falls outside `wt`'s capped history walk),
+   `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
+   servers/watchers under the worktree before removal). No worktree for the branch → nothing to
+   remove.
+5. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
+   the ref (the pure matcher whose boolean face powers the `grove go` gate), then `cmux
+   workspace close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal
+   above. A missing or manually-renamed tab yields no ref and is skipped (fails safe).
+
+**Safety model (ratifying issue #15).** #15 proposed a GitHub-PR-state merge guard
+(`gh pr view --json state`) because a naive `git branch --merged` reports squash-merged
+branches as unmerged forever. That guard is consciously **superseded**: `wt`'s branch cleanup
+runs six merged-checks — same-commit, ancestor, three-dot diff, tree match, **simulated
+merge**, and **patch-id** — that are already squash-aware, need no network or `gh`, and cover
+branches that never had a PR. And where #15 said *refuse* removal of an unmerged branch, `wt`'s
+model is **proceed-but-preserve**: the worktree is removed and the tab closed, but the branch —
+and every commit on it — is kept unless `-D`. Nothing committed is ever destroyed, and
+`grove go <branch>` re-materializes the worktree from the kept branch (the issue #2 flow), so
+an early `grove rm` fully recomposes. The only hard gates are the dirty-tree refusal
+(`--force`) and unmerged-branch deletion (`-D`).
+
+Because the safety lives in `wt` (dirty-tree refusal, merged-only branch deletion) and `-y`
+suppresses only *approval* prompts, `grove rm` needs no confirmation prompt of its own — it
+stays as non-interactive as `grove go`. For the **merged-and-done** case, `wt merge`
+(squash→rebase→ff→remove) and `grove rm` compose: merge with `wt`, then `grove rm` closes the
+now-orphaned tab (and no-ops the already-gone worktree).
+
 ## cmux CLI contract (reverse-engineered)
 
 The cmux binary lives at `/Applications/cmux.app/Contents/Resources/bin/cmux` (grove
@@ -78,7 +137,8 @@ auto-detects it; override with `GROVE_CMUX`). Relevant JSON shapes:
 | `workspace create … --json` | `{surface_ref, window_ref, workspace_ref}` | `.workspace_ref` |
 | `workspace-group create … --json` | `{group: {ref, anchor_workspace_ref, member_workspace_refs, …}}` | `.group.ref` |
 | `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs, custom_color, icon_symbol}]}` | `.groups[] | select(.name==…) | .ref` |
-| `workspace list --json` | `{window_ref, workspaces: [{ref, title, custom_title, current_directory, …}]}` | member `ref` → `title`, for the attach gate (below) |
+| `workspace list --json` | `{window_ref, workspaces: [{ref, title, custom_title, current_directory, …}]}` | member `ref` → `title`, for the attach gate (below) and `grove rm`'s close target |
+| `workspace close <ref>` | — | — (`grove rm` closes the branch's tab; closing a *member* keeps the group) |
 | `workspace-group add --group <ref> --workspace <ref>` | — | — |
 | `workspace-group set-color <g> --hex #RRGGBB` / `set-icon <g> --symbol <sf>` | — | — (styling; see below) |
 
@@ -286,6 +346,8 @@ generated `.envrc` gives every worktree the right account.
 - ~~Keeping the default branch fresh~~ — done at branch-creation time: new worktrees
   branch from a freshly fetched `origin/<default>` (issue #14), so there's no need to
   eagerly refresh the local default after every merge.
-- `grove rm` teardown, graceful handling of existing branches.
+- ~~`grove rm` teardown, graceful handling of existing branches~~ — both done:
+  `grove rm` (below) closes the cmux tab + `wt remove`s the worktree, and `grove go`
+  resolves-or-creates existing branches (issue #2).
 
 See the [issue tracker](https://github.com/jlopez/grove/issues) for the live backlog.
