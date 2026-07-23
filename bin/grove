@@ -279,6 +279,67 @@ grove_attached_workspace_ref() {
   grove_ref_in_group "$groups" "$workspaces" "$repo" "$branch"
 }
 
+# grove_orphan_candidates <groups-json> <workspaces-json> — print one
+# "ref<TAB>current_directory" line per workspace that belongs to NO group
+# (neither a member nor an anchor of any group — anchors also appear in
+# member_workspace_refs, but both are checked belt-and-suspenders). Pure (only
+# needs jq) so it's unit-testable without cmux; the path filtering — which needs
+# the filesystem to canonicalize — lives in grove_adopt_orphans. Missing keys
+# fall back to []/"" and malformed listings die inside jq, so a shape change
+# fails closed (empty output → nothing adopted), never on a bash error.
+grove_orphan_candidates() {
+  printf '%s' "$2" | jq -r --argjson groups "$1" '
+    [ ($groups.groups // [])[]
+      | (.member_workspace_refs // [])[], (.anchor_workspace_ref // empty)
+    ] as $grouped
+    | (.workspaces // [])[]
+    | select(.ref as $r | $grouped | index($r) | not)
+    | [.ref, (.current_directory // "")] | @tsv
+  ' 2>/dev/null
+}
+
+# grove_adopt_orphans <cmux> <repo> <gid> <canon-repo> — self-heal after a group
+# dissolution (issue #23). Closing a group's anchor tab dissolves the group but
+# its member workspaces survive UNGROUPED; the next `grove go` recreates the
+# group yet only attaches the workspace it just spawned (the attach matcher is
+# deliberately group-scoped), stranding the rest forever. So after the group is
+# ensured, sweep: any workspace in no group whose current_directory canonicalizes
+# (pwd -P, as the primary-checkout guards do) to one of THIS repo's linked
+# worktrees — per `wt list`, main checkout excluded (that's the header's job) —
+# is re-attached. Conservative and idempotent by construction: a workspace in
+# any group is never touched, other repos' paths never match, and every failure
+# (cmux/wt listing, vanished directory) degrades to "adopt nothing".
+grove_adopt_orphans() {
+  local cmux="$1" repo="$2" gid="$3" canon_repo="$4"
+  local groups workspaces wt_paths p canon
+  groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)  || return 0
+  workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)    || return 0
+  wt_paths=$(wt list --format json 2>/dev/null | jq -r '.[].path' 2>/dev/null) || return 0
+  # Canonical paths of this repo's linked worktrees (main checkout excluded).
+  local paths=()
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    canon=$(cd "$p" 2>/dev/null && pwd -P) || continue
+    [ "$canon" != "$canon_repo" ] || continue
+    paths+=("$canon")
+  done <<<"$wt_paths"
+  [ ${#paths[@]} -gt 0 ] || return 0
+  local ref dir
+  while IFS=$'\t' read -r ref dir; do
+    { [ -n "$ref" ] && [ -n "$dir" ]; } || continue
+    canon=$(cd "$dir" 2>/dev/null && pwd -P) || continue
+    for p in "${paths[@]}"; do
+      [ "$canon" = "$p" ] || continue
+      if CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ref" >/dev/null 2>&1; then
+        info "adopted orphaned workspace ${_c_bld}$ref${_c_rst} into group '$repo'"
+      else
+        warn "could not adopt orphaned workspace $ref into group '$repo'"
+      fi
+      break
+    done
+  done < <(grove_orphan_candidates "$groups" "$workspaces")
+}
+
 # grove_resolve_base <opt-base> <opt-no-fetch> — set GROVE_BASE_ARGS (an array) to
 # the `--base <ref>` worktrunk should branch a brand-new worktree from, applying
 # freshness-by-default (issue #14). worktrunk's `wt switch -c` branches from the
@@ -406,7 +467,14 @@ grove_go() {
             --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
   fi
 
-  # 7. Reconcile group styling from this worktree's .grove.json (deterministic
+  # 7. Adopt orphans (issue #23): if this repo's group was dissolved (anchor tab
+  #    closed), its surviving workspaces are ungrouped and invisible to the
+  #    group-scoped matchers — re-attach any whose cwd is one of this repo's
+  #    worktrees, so a `grove go` self-heals the sidebar instead of stranding them.
+  { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
+    && grove_adopt_orphans "$CMUX" "$REPO" "$gid" "$canon_repo"
+
+  # 8. Reconcile group styling from this worktree's .grove.json (deterministic
   #    color by default).
   { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
     && grove_apply_style "$CMUX" "$gid" "$REPO" "$WORKTREE_ROOT"

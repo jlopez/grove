@@ -7,6 +7,14 @@ All notable changes to grove are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `grove go` now **adopts orphaned workspaces** after a group dissolution (issue #23).
+  Closing a group's anchor tab dissolves the group but leaves its member workspaces
+  alive and ungrouped, and recreating the group only attached the newly spawned
+  workspace — stranding the survivors. Once the repo group is ensured, `grove go`
+  sweeps for workspaces in *no* group whose directory canonicalizes to one of this
+  repo's linked worktrees (main checkout excluded) and re-attaches them. Conservative
+  and idempotent: workspaces already in any group are never touched, and other repos'
+  workspaces never match — so the next `grove go` self-heals the sidebar.
 - `grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]` — the
   inverse of `grove go`: tear down a worktree you're done with. grove owns the
   workspace↔branch bridge nobody else knows, so it closes the cmux tab that

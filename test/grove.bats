@@ -468,6 +468,142 @@ JSON
   [ -z "$(grove_ref_in_group '{}' '{}' grove "grove")" ]
 }
 
+# --- orphan adoption after group dissolution (issue #23) ---------------------
+# grove_orphan_candidates is the pure half of the adoption sweep: it lists
+# "ref<TAB>cwd" for every workspace in NO group. Fixtures mirror the real
+# listing shapes (anchors also appear in member_workspace_refs).
+
+_adopt_groups_json() {
+  cat <<'JSON'
+{ "groups": [
+  { "ref": "workspace_group:1", "name": "grove",
+    "anchor_workspace_ref": "workspace:10",
+    "member_workspace_refs": ["workspace:10", "workspace:11"] },
+  { "ref": "workspace_group:2", "name": "other",
+    "anchor_workspace_ref": "workspace:20",
+    "member_workspace_refs": ["workspace:21"] }
+] }
+JSON
+}
+_adopt_ws_json() {
+  cat <<'JSON'
+{ "workspaces": [
+  { "ref": "workspace:10", "title": "grove",     "current_directory": "/repos/grove" },
+  { "ref": "workspace:11", "title": "feature/a", "current_directory": "/repos/wt/a" },
+  { "ref": "workspace:20", "title": "other",     "current_directory": "/repos/other" },
+  { "ref": "workspace:30", "title": "feature/b", "current_directory": "/repos/wt/b" },
+  { "ref": "workspace:31", "title": "feature/c", "current_directory": "/repos/wt/c" }
+] }
+JSON
+}
+
+@test "orphan_candidates: lists only workspaces in no group, with their cwd" {
+  set +eu
+  source "$GROVE"
+  local out; out=$(grove_orphan_candidates "$(_adopt_groups_json)" "$(_adopt_ws_json)")
+  [ "$out" = "$(printf 'workspace:30\t/repos/wt/b\nworkspace:31\t/repos/wt/c')" ]
+}
+
+@test "orphan_candidates: an anchor not listed among members is still grouped" {
+  # workspace:20 is only the ANCHOR of group 'other' (not in its member refs) —
+  # it must not be offered for adoption.
+  set +eu
+  source "$GROVE"
+  local out; out=$(grove_orphan_candidates "$(_adopt_groups_json)" "$(_adopt_ws_json)")
+  [[ "$out" != *"workspace:20"* ]]
+}
+
+@test "orphan_candidates: no groups at all → every workspace is a candidate" {
+  set +eu
+  source "$GROVE"
+  local out; out=$(grove_orphan_candidates '{ "groups": [] }' "$(_adopt_ws_json)")
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "5" ]
+}
+
+@test "orphan_candidates: missing cwd → empty field, malformed listings → empty" {
+  set +eu
+  source "$GROVE"
+  local ws='{ "workspaces": [ { "ref": "workspace:30" } ] }'
+  [ "$(grove_orphan_candidates '{ "groups": [] }' "$ws")" = "$(printf 'workspace:30\t')" ]
+  [ -z "$(grove_orphan_candidates '{}' '{}')" ]        # missing keys fail closed
+  [ -z "$(grove_orphan_candidates 'not json' '{}')" ]  # malformed groups fail closed
+}
+
+# grove_adopt_orphans is the I/O half: stub cmux (serves the fixtures, records
+# `workspace-group add` calls) and wt (serves this repo's worktree list) to
+# verify the sweep attaches exactly the right workspaces — no real cmux needed.
+
+_adopt_setup() { # populates $STUB — a fake repo layout + cmux/wt stubs on PATH
+  STUB="$BATS_TEST_TMPDIR/adopt"
+  mkdir -p "$STUB/bin" "$STUB/repo-main" "$STUB/wt-a" "$STUB/wt-b" "$STUB/elsewhere"
+  ln -s "$STUB/wt-a" "$STUB/link-a"   # symlinked cwd must still match (pwd -P)
+  cat > "$STUB/bin/cmux" <<SH
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "workspace-group list") cat "$STUB/groups.json" ;;
+  "workspace list")       cat "$STUB/workspaces.json" ;;
+  "workspace-group add")  echo "\$*" >> "$STUB/adds.log" ;;
+esac
+SH
+  cat > "$STUB/bin/wt" <<SH
+#!/usr/bin/env bash
+cat "$STUB/wt.json"
+SH
+  chmod +x "$STUB/bin/cmux" "$STUB/bin/wt"
+  cat > "$STUB/wt.json" <<JSON
+[ { "branch": "main",      "path": "$STUB/repo-main" },
+  { "branch": "feature/a", "path": "$STUB/wt-a" },
+  { "branch": "feature/b", "path": "$STUB/wt-b" } ]
+JSON
+  cat > "$STUB/groups.json" <<'JSON'
+{ "groups": [ { "ref": "workspace_group:1", "name": "myrepo",
+                "anchor_workspace_ref": "workspace:1",
+                "member_workspace_refs": ["workspace:1", "workspace:2"] } ] }
+JSON
+  cat > "$STUB/workspaces.json" <<JSON
+{ "workspaces": [
+  { "ref": "workspace:1", "current_directory": "$STUB/repo-main" },
+  { "ref": "workspace:2", "current_directory": "$STUB/wt-a" },
+  { "ref": "workspace:3", "current_directory": "$STUB/link-a" },
+  { "ref": "workspace:4", "current_directory": "$STUB/elsewhere" },
+  { "ref": "workspace:5", "current_directory": "$STUB/repo-main" },
+  { "ref": "workspace:6", "current_directory": "$STUB/gone" }
+] }
+JSON
+}
+
+@test "adopt_orphans: attaches exactly this repo's ungrouped worktree workspaces" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  # The call-site contract: <canon-repo> arrives already canonicalized (pwd -P),
+  # exactly as grove_go computes it in the primary-checkout guard.
+  local canon_main; canon_main=$(cd "$STUB/repo-main" && pwd -P)
+  PATH="$STUB/bin:$PATH" \
+    grove_adopt_orphans "$STUB/bin/cmux" myrepo workspace_group:1 "$canon_main" 2>/dev/null
+  # workspace:2 grouped → untouched; :3 orphan via symlink → adopted (pwd -P);
+  # :4 other repo → skipped; :5 orphan at MAIN checkout → skipped (header's job);
+  # :6 vanished dir → skipped.
+  [ -f "$STUB/adds.log" ]
+  [ "$(cat "$STUB/adds.log")" = "workspace-group add --group workspace_group:1 --workspace workspace:3" ]
+}
+
+@test "adopt_orphans: nothing to adopt → no add calls (idempotent re-run)" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  # Everything grouped: promote workspace:3..6 into the group too.
+  cat > "$STUB/groups.json" <<'JSON'
+{ "groups": [ { "ref": "workspace_group:1", "name": "myrepo",
+                "anchor_workspace_ref": "workspace:1",
+                "member_workspace_refs": ["workspace:1", "workspace:2", "workspace:3",
+                                          "workspace:4", "workspace:5", "workspace:6"] } ] }
+JSON
+  PATH="$STUB/bin:$PATH" \
+    grove_adopt_orphans "$STUB/bin/cmux" myrepo workspace_group:1 "$STUB/repo-main" 2>/dev/null
+  [ ! -f "$STUB/adds.log" ]
+}
+
 # --- base resolution for new worktrees (issue #14) ---------------------------
 # grove_resolve_base sets GROVE_BASE_ARGS (an array) and never hard-fails. The
 # escape-hatch and no-origin paths need no network, so they're unit-testable.
