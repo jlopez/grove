@@ -279,6 +279,67 @@ grove_attached_workspace_ref() {
   grove_ref_in_group "$groups" "$workspaces" "$repo" "$branch"
 }
 
+# grove_group_ref <groups-json> <repo> — print the ref of the cmux group named
+# <repo>, or nothing. Pure (jq only); missing/misshapen keys fail closed to "".
+grove_group_ref() {
+  printf '%s' "$1" | jq -r --arg n "$2" \
+    'first((.groups // [])[] | select(.name==$n) | .ref) // empty' 2>/dev/null
+}
+
+# grove_group_anchor_ref <groups-json> <repo> — print the anchor workspace ref of
+# the cmux group named <repo>, or nothing. The anchor IS the group header: per
+# the cmux contract, closing it dissolves the group (members survive, ungrouped),
+# which is why grove rm must never close a workspace while it still anchors its
+# group (issue #22).
+grove_group_anchor_ref() {
+  printf '%s' "$1" | jq -r --arg n "$2" \
+    'first((.groups // [])[] | select(.name==$n) | .anchor_workspace_ref) // empty' 2>/dev/null
+}
+
+# grove_member_at_cwd <groups-json> <workspaces-json> <repo> <cwd> <skip-ref> —
+# print the ref of a member workspace of cmux group <repo> whose
+# current_directory is exactly <cwd>, never <skip-ref> (the tab about to close).
+# Pure; finds the repo-header workspace when re-anchoring. Exact string compare
+# is fine: a miss just means a fresh header gets created, never a wrong anchor.
+grove_member_at_cwd() {
+  printf '%s' "$2" | jq -r \
+    --argjson groups "$1" --arg repo "$3" --arg cwd "$4" --arg skip "$5" '
+      [ (($groups.groups // [])[] | select(.name==$repo)) ] as $g
+      | ($g[0].member_workspace_refs // []) as $members
+      | first((.workspaces // [])[]
+              | select((.ref as $r | $members | index($r))
+                       and .current_directory == $cwd
+                       and .ref != $skip)
+              | .ref) // empty
+    ' 2>/dev/null
+}
+
+# grove_reanchor_group <cmux> <groups-json> <workspaces-json> <repo> <repo-path>
+# <avoid-ref> — re-anchor the repo's cmux group onto the repo-header workspace at
+# the main checkout (mirroring how `grove go` anchors groups at creation), so
+# closing <avoid-ref> can no longer dissolve the group. Prefers a member already
+# at the main checkout; otherwise creates the header workspace and files it under
+# the group. Exit 0 only when a fresh listing confirms the anchor actually moved.
+grove_reanchor_group() {
+  local cmux="$1" groups="$2" workspaces="$3" repo="$4" repo_path="$5" avoid="$6"
+  local gid hdr
+  gid=$(grove_group_ref "$groups" "$repo")
+  [ -n "$gid" ] || return 1
+  hdr=$(grove_member_at_cwd "$groups" "$workspaces" "$repo" "$repo_path" "$avoid")
+  if [ -z "$hdr" ]; then
+    hdr=$(CMUX_QUIET=1 "$cmux" workspace create \
+            --cwd "$repo_path" --name "$repo" --json 2>/dev/null \
+          | jq -r '.workspace_ref // empty')
+    { [ -n "$hdr" ] && [ "$hdr" != "null" ]; } || return 1
+    CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$hdr" >/dev/null 2>&1 \
+      || return 1
+  fi
+  CMUX_QUIET=1 "$cmux" workspace-group set-anchor --group "$gid" --workspace "$hdr" >/dev/null 2>&1 \
+    || return 1
+  groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null) || return 1
+  [ "$(grove_group_anchor_ref "$groups" "$repo")" = "$hdr" ]
+}
+
 # grove_resolve_base <opt-base> <opt-no-fetch> — set GROVE_BASE_ARGS (an array) to
 # the `--base <ref>` worktrunk should branch a brand-new worktree from, applying
 # freshness-by-default (issue #14). worktrunk's `wt switch -c` branches from the
@@ -522,9 +583,29 @@ grove_rm() {
   # 2. Close the cmux workspace attached to <branch>, if any — LAST, so closing
   #    grove's own tab can't abort the removal above. A missing/renamed tab just
   #    yields no ref (fails safe), leaving nothing to close.
-  local ws
-  ws=$(grove_attached_workspace_ref "$CMUX" "$REPO" "$branch") || ws=""
+  local groups workspaces ws
+  groups=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json 2>/dev/null) || groups='{}'
+  workspaces=$(CMUX_QUIET=1 "$CMUX" workspace list --json 2>/dev/null)   || workspaces='{}'
+  ws=$(grove_ref_in_group "$groups" "$workspaces" "$REPO" "$branch")
   if [ -n "$ws" ]; then
+    # Anchor guard (issue #22). The primary-checkout guard above assumes the
+    # group's anchor is the repo-header workspace at the main checkout — true for
+    # grove-created groups, but a legacy or UI-created group can be anchored on
+    # any member tab, and closing the anchor dissolves the group (orphaning its
+    # members, per the cmux contract). If the close target IS the anchor,
+    # re-anchor the group to the repo header first; if that fails, refuse to
+    # close rather than dissolve the group.
+    if [ "$ws" = "$(grove_group_anchor_ref "$groups" "$REPO")" ]; then
+      info "workspace $ws anchors group '$REPO' — re-anchoring to the repo header first…"
+      if grove_reanchor_group "$CMUX" "$groups" "$workspaces" "$REPO" "$REPO_PATH" "$ws"; then
+        info "re-anchored group '${_c_bld}$REPO${_c_rst}' at its main checkout"
+      else
+        warn "could not re-anchor group '$REPO' — leaving workspace $ws open"
+        warn "(closing it now would dissolve the group and orphan its members;"
+        warn " re-anchor manually — cmux workspace-group set-anchor — then close the tab)"
+        return 0
+      fi
+    fi
     info "closing workspace ${_c_bld}$ws${_c_rst} ($branch)…"
     CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
       || warn "could not close workspace $ws (already gone?)"
@@ -730,6 +811,9 @@ ${_c_bld}Usage:${_c_rst}
                                   origin/<default> first so a fresh squash-merge
                                   counts — --no-fetch skips). -D force-deletes an
                                   unmerged branch, --keep-branch always keeps it.
+                                  If the tab anchors its cmux group, the group is
+                                  re-anchored to the repo header first (a group is
+                                  never dissolved; refuses to close on failure).
   grove restyle [--color C] [--icon S]   Re-apply this repo's group color/icon
   grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
   grove doctor                    Check dependencies and wiring
