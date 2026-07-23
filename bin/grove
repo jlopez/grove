@@ -232,39 +232,30 @@ grove_worktree_path() {
 }
 
 # grove_title_in_group <groups-json> <workspaces-json> <repo> <branch> — exit 0
-# iff some member workspace of the cmux group named <repo> has title == <branch>.
-# Pure (only needs jq): the I/O lives in grove_branch_attached. Keys on the
-# workspace title — grove sets `--name <branch>` at create, so title == branch
-# (custom_title is matched too, belt-and-suspenders, in case title drifts) — and
-# is scoped to the repo group's members, so a same-named branch in another repo's
-# group never false-matches. Missing `.groups`/`.workspaces`/`member_workspace_refs`
-# fall back to `[]` so a shape change fails closed (exit 1), not on a jq error.
+# iff some member workspace of the cmux group named <repo> is attached to
+# <branch>. Boolean face of grove_ref_in_group: attached means the matcher
+# finds a ref.
 grove_title_in_group() {
-  printf '%s' "$2" | jq -e \
-    --argjson groups "$1" --arg repo "$3" --arg branch "$4" '
-      [ (($groups.groups // [])[] | select(.name==$repo)) ] as $g
-      | ($g[0].member_workspace_refs // []) as $members
-      | any((.workspaces // [])[];
-            (.ref as $r | $members | index($r))
-            and (.title == $branch or .custom_title == $branch))
-    ' >/dev/null 2>&1
+  [ -n "$(grove_ref_in_group "$1" "$2" "$3" "$4")" ]
 }
 
 # grove_branch_attached <cmux> <repo> <branch> — exit 0 iff a cmux workspace in
-# the repo's group is already attached to <branch> (see grove_title_in_group).
-# Fetches the two cmux listings, then delegates the match to the pure helper.
+# the repo's group is already attached to <branch>. Boolean face of
+# grove_attached_workspace_ref; a failed cmux listing yields no ref (exit 1).
 grove_branch_attached() {
-  local cmux="$1" repo="$2" branch="$3" groups workspaces
-  groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)   || return 1
-  workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)     || return 1
-  grove_title_in_group "$groups" "$workspaces" "$repo" "$branch"
+  [ -n "$(grove_attached_workspace_ref "$1" "$2" "$3")" ]
 }
 
 # grove_ref_in_group <groups-json> <workspaces-json> <repo> <branch> — print the
 # ref of the member workspace of cmux group <repo> whose title == <branch> (or
-# custom_title, belt-and-suspenders), or nothing. The value-returning sibling of
-# grove_title_in_group (same scoping + fail-closed defaults), used by `grove rm`
-# to find the tab to close. `first(...)` stops at the first match; `// empty`
+# custom_title, belt-and-suspenders in case title drifts), or nothing. Pure
+# (only needs jq): the I/O lives in grove_attached_workspace_ref. Keys on the
+# workspace title — grove sets `--name <branch>` at create, so title == branch —
+# and is scoped to the repo group's members, so a same-named branch in another
+# repo's group never false-matches. Missing `.groups`/`.workspaces`/
+# `member_workspace_refs` fall back to `[]` so a shape change fails closed
+# (empty output), not on a jq error. `first(...)` is total, not lossy: the
+# `grove go` attach-gate guarantees at most one workspace per branch. `// empty`
 # prints nothing when none matches, so a missing/renamed tab yields "".
 grove_ref_in_group() {
   printf '%s' "$2" | jq -r \
@@ -280,7 +271,7 @@ grove_ref_in_group() {
 
 # grove_attached_workspace_ref <cmux> <repo> <branch> — print the ref of the cmux
 # workspace in the repo's group attached to <branch>, or nothing. Fetches the two
-# listings (as grove_branch_attached does), then delegates to the pure matcher.
+# listings, then delegates to the pure matcher.
 grove_attached_workspace_ref() {
   local cmux="$1" repo="$2" branch="$3" groups workspaces
   groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)   || return 1
@@ -426,25 +417,30 @@ grove_go() {
 }
 
 # =============================================================================
-# grove rm [--force] [--keep-branch] [--reap] [<branch>]
+# grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
 # The inverse of `grove go`: close the cmux workspace attached to <branch> and
 # remove its worktree. grove owns the workspace↔branch bridge (nobody else knows
 # it), so it closes the tab `wt remove`/`wt merge` would otherwise strand; the
 # git side is delegated to `wt remove`, which is safe by default — it refuses a
-# dirty worktree without --force and deletes the branch only when it's merged.
+# dirty worktree without --force, and its merged-branch detection is squash-aware
+# (six conditions incl. simulated merge + patch-id), superseding issue #15's
+# proposed gh-PR-state guard; see "safety model" in docs/design.md. An unmerged
+# branch is kept, never deleted, unless -D.
 # =============================================================================
 grove_rm() {
-  local opt_force="" opt_keep="" opt_reap="" branch=""
+  local opt_force="" opt_forcedel="" opt_keep="" opt_reap="" opt_no_fetch="" branch=""
   # Unlike `grove go` (whose trailing tokens are the prompt), `grove rm` has no
   # free-form tail — so flags may appear in any position and a second positional
   # is a mistake we reject, rather than silently dropping a post-branch --force
   # (which would then be re-suggested by the failure hint — a confusing loop).
   while [ $# -gt 0 ]; do
     case "$1" in
-      -f|--force)    opt_force=1; shift ;;
-      --keep-branch) opt_keep=1; shift ;;
-      --reap)        opt_reap=1; shift ;;
-      -h|--help)     echo "usage: grove rm [--force] [--keep-branch] [--reap] [<branch>]"; return 0 ;;
+      -f|--force)         opt_force=1; shift ;;
+      -D|--force-delete)  opt_forcedel=1; shift ;;
+      --keep-branch)      opt_keep=1; shift ;;
+      --reap)             opt_reap=1; shift ;;
+      --no-fetch)         opt_no_fetch=1; shift ;;
+      -h|--help)          echo "usage: grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]"; return 0 ;;
       --)            shift
                      while [ $# -gt 0 ]; do
                        [ -z "$branch" ] || die "grove rm: unexpected argument '$1'"
@@ -474,7 +470,8 @@ grove_rm() {
   # anchor/header). Compare canonicalized paths, as `grove go` does. Removing a
   # *member* leaves the group intact; only closing the anchor dissolves it.
   local wtpath canon_wt canon_repo
-  wtpath=$(grove_worktree_path "$branch") || wtpath=""
+  wtpath=$(grove_worktree_path "$branch") \
+    || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
   if [ -n "$wtpath" ]; then
     canon_wt=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_wt="$wtpath"
     canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P) || canon_repo="$REPO_PATH"
@@ -493,10 +490,27 @@ grove_rm() {
   #    (as `grove go` does on `wt switch`), so a repo with pre-remove hooks doesn't
   #    hang non-interactively.
   if [ -n "$wtpath" ]; then
+    # Freshness — the teardown mirror of issue #14: wt deletes the branch only
+    # when its merged-checks say it adds nothing to the default branch, compared
+    # against origin/<default> *as last fetched*. Run right after a squash merge
+    # (`gh pr merge -sd`), a stale ref makes the just-merged branch look
+    # unmerged, so wt would keep it — the branch half of the leak #15 exists to
+    # fix. Refresh just that ref first; every failure degrades gracefully (the
+    # branch may be kept, never lost).
+    if [ -z "$opt_no_fetch" ]; then
+      local def
+      def=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null) || def=""
+      def=${def#origin/}
+      if [ -n "$def" ]; then
+        git fetch origin "$def" --quiet 2>/dev/null \
+          || warn "could not fetch origin/$def — merged-branch detection may be stale"
+      fi
+    fi
     local rm_args=("$branch" -y)
-    [ -n "$opt_force" ] && rm_args+=(--force)
-    [ -n "$opt_keep" ]  && rm_args+=(--no-delete-branch)
-    [ -n "$opt_reap" ]  && rm_args+=(--reap)
+    [ -n "$opt_force" ]    && rm_args+=(--force)
+    [ -n "$opt_forcedel" ] && rm_args+=(--force-delete)
+    [ -n "$opt_keep" ]     && rm_args+=(--no-delete-branch)
+    [ -n "$opt_reap" ]     && rm_args+=(--reap)
     info "removing worktree for '$branch'…"
     wt remove "${rm_args[@]}" \
       || die "worktree removal failed for '$branch' (dirty tree? re-run 'grove rm --force')"
@@ -707,12 +721,15 @@ ${_c_bld}Usage:${_c_rst}
                                   New branches fetch and branch from origin/<default>
                                   by default; --base <ref> overrides the base (e.g.
                                   @ for current HEAD), --no-fetch stays offline.
-  grove rm [--force] [--keep-branch] [--reap] [<branch>]
+  grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
                                   Tear down a worktree you're done with: close its
                                   cmux workspace and 'wt remove' the worktree
                                   (defaults to the current branch). Safe by default —
                                   refuses a dirty tree without --force, and deletes
-                                  the branch only if merged (--keep-branch to keep it).
+                                  the branch only if merged (squash-aware; fetches
+                                  origin/<default> first so a fresh squash-merge
+                                  counts — --no-fetch skips). -D force-deletes an
+                                  unmerged branch, --keep-branch always keeps it.
   grove restyle [--color C] [--icon S]   Re-apply this repo's group color/icon
   grove init [--with-multi-account]   Optional wiring (alias, cmux plugin, direnv)
   grove doctor                    Check dependencies and wiring

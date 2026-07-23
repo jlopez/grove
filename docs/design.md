@@ -83,7 +83,12 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
    group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
    leaves the group intact — only closing the **anchor** dissolves it — so teardown never
    collapses the sidebar group out from under your other worktrees.
-3. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
+3. **Refresh the merge baseline** — fetch just `origin/<default>` (the teardown mirror of
+   issue #14's freshness-by-default). `wt`'s merged-branch checks compare against
+   `origin/<default>` *as last fetched*, so run right after `gh pr merge -sd` a stale ref would
+   make the just-squash-merged branch look unmerged and leak it. `--no-fetch` opts out; a
+   failed fetch warns and proceeds (worst case the branch is kept, never lost).
+4. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
    it *"Remove[s the] worktree; delete[s the] branch if merged"*, and **refuses a dirty
    worktree** without `-f`. This runs **before** the tab is closed (step 4): `grove rm` is meant
    to be run from inside the worktree's *own* tab, and closing that tab first could kill `grove`
@@ -94,13 +99,27 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
    `wt switch` — so a repo with `pre-remove` hooks doesn't hang non-interactively (it does *not*
    bypass the dirty-tree refusal, which is a hard `--force` gate, not a prompt). grove forwards
    `--force` → `wt --force` (also needed for the untracked-`.envrc` wrinkle above),
+   `-D`/`--force-delete` → `wt --force-delete` (delete a genuinely unmerged branch — also
+   needed when a squash merge falls outside `wt`'s capped history walk),
    `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
    servers/watchers under the worktree before removal). No worktree for the branch → nothing to
    remove.
-4. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
-   the ref (the value-returning sibling of the gate's boolean matcher), then `cmux workspace
-   close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal above. A
-   missing or manually-renamed tab yields no ref and is skipped (fails safe).
+5. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
+   the ref (the pure matcher whose boolean face powers the `grove go` gate), then `cmux
+   workspace close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal
+   above. A missing or manually-renamed tab yields no ref and is skipped (fails safe).
+
+**Safety model (ratifying issue #15).** #15 proposed a GitHub-PR-state merge guard
+(`gh pr view --json state`) because a naive `git branch --merged` reports squash-merged
+branches as unmerged forever. That guard is consciously **superseded**: `wt`'s branch cleanup
+runs six merged-checks — same-commit, ancestor, three-dot diff, tree match, **simulated
+merge**, and **patch-id** — that are already squash-aware, need no network or `gh`, and cover
+branches that never had a PR. And where #15 said *refuse* removal of an unmerged branch, `wt`'s
+model is **proceed-but-preserve**: the worktree is removed and the tab closed, but the branch —
+and every commit on it — is kept unless `-D`. Nothing committed is ever destroyed, and
+`grove go <branch>` re-materializes the worktree from the kept branch (the issue #2 flow), so
+an early `grove rm` fully recomposes. The only hard gates are the dirty-tree refusal
+(`--force`) and unmerged-branch deletion (`-D`).
 
 Because the safety lives in `wt` (dirty-tree refusal, merged-only branch deletion) and `-y`
 suppresses only *approval* prompts, `grove rm` needs no confirmation prompt of its own — it

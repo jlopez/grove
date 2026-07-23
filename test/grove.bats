@@ -104,6 +104,14 @@ setup() {
   [[ "$output" != *"unknown option"* ]]
 }
 
+@test "rm accepts -D and --no-fetch (wt passthrough + freshness opt-out parse)" {
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" rm -D --no-fetch feature/x
+  [ "$status" -ne 0 ]                        # bails (no git repo / no deps)
+  [[ "$output" != *"unknown option"* ]]
+  [[ "$output" != *"unexpected argument"* ]]
+}
+
 @test "doctor runs and reports sections" {
   run "$GROVE" doctor
   # status may be non-zero if deps are missing (expected in CI); just check output
