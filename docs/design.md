@@ -56,8 +56,14 @@ whole dance.
    group's anchor/header), stop: grove targets *linked* worktrees, not the header. Paths
    are canonicalized before comparison. Often redundant with `wt switch`'s own refusal,
    but a clean message beats a raw `wt` error.
-4. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command 'claude "<prompt>"' --json`.
-   The prompt is shell-quoted so the agent receives it as a single initial-prompt arg.
+4. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command <launch> --json`.
+   cmux *types* the launch line into the new pty, whose canonical-mode input buffer caps a
+   line at ~1KB — so the prompt never rides the line itself (issue #26). A non-empty prompt
+   is written to a private `mktemp` file outside the worktree (kept clean for `wt remove`),
+   and the typed line reads and immediately reclaims it:
+   `p=$(cat -- <file>) && rm -f -- <file> && claude "$p"` — short and length-invariant, and
+   the agent still receives the prompt as a single initial-prompt arg. Empty prompt → bare
+   agent launch.
 5. **File it under the repo group** — add to the existing group, or create it on first
    use with the **main checkout as the anchor/header**.
 6. **Adopt orphans** (issue #23) — closing a group's anchor tab *dissolves* the group
@@ -310,7 +316,8 @@ personal tweak in `.grove.local.json`. This proves the abstraction with a real s
 
 **Second consumer:** the launched agent. `grove go` reads `agent.command` (the executable,
 default `claude`, with `GROVE_COMMAND` as its per-keypath env override) and the `agent.args`
-array, `printf %q`-quoting each token plus the prompt into the command cmux types. `grove
+array, `printf %q`-quoting each token into the command cmux types; the prompt itself travels
+via a read-and-reclaimed temp file, not the typed line (issue #26). `grove
 doctor` resolves the same `agent.command` to decide which binary to probe, instead of a
 hardcoded `claude`.
 

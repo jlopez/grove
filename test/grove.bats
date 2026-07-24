@@ -316,13 +316,14 @@ setup() {
   [ "$(grove_build_launch)" = "claude" ]
 }
 
-@test "build_launch: command + args + prompt, each %q-quoted" {
+@test "build_launch: command + args + prompt file → read-and-reclaim line" {
   set +eu
   source "$GROVE"
   local d; d="$BATS_TEST_TMPDIR/launch"; mkdir -p "$d"
   printf '%s\n' '{ "agent": { "command": "aider", "args": ["--model", "gpt 4"] } }' > "$d/.grove.json"
   grove_config_load "$d"
-  [ "$(grove_build_launch 'fix the bug')" = "aider --model gpt\\ 4 fix\\ the\\ bug" ]
+  local f="$d/pfile"; : > "$f"
+  [ "$(grove_build_launch "$f")" = "p=\$(cat -- $f) && rm -f -- $f && aider --model gpt\\ 4 \"\$p\"" ]
 }
 
 @test "build_launch: GROVE_COMMAND overrides agent.command" {
@@ -331,7 +332,45 @@ setup() {
   local d; d="$BATS_TEST_TMPDIR/launchenv"; mkdir -p "$d"
   printf '%s\n' '{ "agent": { "command": "claude" } }' > "$d/.grove.json"
   grove_config_load "$d"
-  [ "$(GROVE_COMMAND=echo grove_build_launch hi)" = "echo hi" ]
+  local f="$d/pfile"; : > "$f"
+  [ "$(GROVE_COMMAND=echo grove_build_launch "$f")" = "p=\$(cat -- $f) && rm -f -- $f && echo \"\$p\"" ]
+}
+
+@test "prompt_tmpfile: verbatim content, private, outside any worktree" {
+  set +eu
+  source "$GROVE"
+  local prompt=$'line one\nline "two" with $dollars and \\backslashes'
+  local f; f=$(TMPDIR="$BATS_TEST_TMPDIR" grove_prompt_tmpfile "$prompt")
+  [ -f "$f" ]
+  case "$f" in "$BATS_TEST_TMPDIR"/grove-prompt.??????) ;; *) false ;; esac
+  [ "$(cat "$f")" = "$prompt" ]
+  # mktemp creates 0600 — the prompt is not world-readable
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ]
+  rm -f -- "$f"
+}
+
+@test "build_launch: typed line length is prompt-length-invariant (issue #26)" {
+  set +eu
+  source "$GROVE"
+  GROVE_CONFIG_JSON='{}'
+  local short long huge
+  short=$(TMPDIR="$BATS_TEST_TMPDIR" grove_prompt_tmpfile "hi")
+  huge=$(printf 'x%.0s' $(seq 1 10000))   # 10KB — far past the ~1KB pty line cap
+  long=$(TMPDIR="$BATS_TEST_TMPDIR" grove_prompt_tmpfile "$huge")
+  [ "${#huge}" -eq 10000 ]
+  [ "$(grove_build_launch "$short" | wc -c)" -eq "$(grove_build_launch "$long" | wc -c)" ]
+  rm -f -- "$short" "$long"
+}
+
+@test "build_launch: executing the line hands the prompt over and reclaims the file" {
+  set +eu
+  source "$GROVE"
+  GROVE_CONFIG_JSON='{}'
+  local prompt='multi word prompt with "quotes"'
+  local f; f=$(TMPDIR="$BATS_TEST_TMPDIR" grove_prompt_tmpfile "$prompt")
+  local launch; launch=$(GROVE_COMMAND=echo grove_build_launch "$f")
+  [ "$(bash -c "$launch")" = "$prompt" ]   # echo "$p" prints the prompt verbatim
+  [ ! -e "$f" ]                            # …and the temp file was reclaimed
 }
 
 @test "config_load: invalid layer is skipped, valid layers still merge" {

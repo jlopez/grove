@@ -7,6 +7,18 @@ All notable changes to grove are documented here. Format follows
 ## [Unreleased]
 
 ### Fixed
+- `grove go` now delivers the prompt to the agent **via a temp file** instead of
+  inlining it in the typed launch command (issue #26). cmux *types* the launch
+  line into the new workspace's pty, whose canonical-mode input buffer caps a
+  line at ~1KB — so long prompts (routine for agent-generated briefs) were
+  silently truncated and the launch lost. The prompt is written to a private
+  `mktemp` file outside the worktree (which must stay clean for `wt remove`),
+  and the typed line reads and immediately reclaims it
+  (`p=$(cat -- <file>) && rm -f -- <file> && claude "$p"`), staying short and
+  length-invariant regardless of prompt size. The file path is used whenever a
+  prompt is present — one code path, no length threshold; an empty prompt keeps
+  the bare-agent launch, and `GROVE_COMMAND=echo` still prints the prompt for
+  safe testing.
 - `grove rm` no longer dissolves a cmux group whose **anchor** is the tab being
   closed (issue #22). The primary-checkout guard assumed the anchor is always
   the repo-header workspace at the main checkout — true for grove-created
