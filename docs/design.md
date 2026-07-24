@@ -60,6 +60,16 @@ whole dance.
    The prompt is shell-quoted so the agent receives it as a single initial-prompt arg.
 5. **File it under the repo group** — add to the existing group, or create it on first
    use with the **main checkout as the anchor/header**.
+6. **Adopt orphans** (issue #23) — closing a group's anchor tab *dissolves* the group
+   but its member workspaces survive **ungrouped**, and recreating the group only
+   attaches the new spawn (the matchers are deliberately group-scoped). So once the
+   group is ensured, sweep `workspace list --json` for workspaces in **no** group whose
+   `current_directory` canonicalizes (`pwd -P`, like the guards) to one of **this
+   repo's** linked worktrees per `wt list` — main checkout excluded (that's the
+   header's job) — and `workspace-group add` each. Conservative and idempotent:
+   a workspace in *any* group is never touched, other repos' paths never match, and
+   any failure (listings, vanished dirs) degrades to adopting nothing — so group
+   dissolution is self-healing on the next `grove go`.
 
 ### Why cmux is drivable from a hook/alias
 
