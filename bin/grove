@@ -113,20 +113,38 @@ grove_config_get_array() {
     | if ($v|type)=="array" then $v[] | tostring else empty end'
 }
 
-# grove_build_launch [prompt] — print the shell command cmux types into a new
-# workspace, from the loaded config: agent.command (GROVE_COMMAND overrides;
-# default claude) then the agent.args array, then the prompt if non-empty. Every
-# token is %q-quoted so args/prompt survive the shell verbatim and the prompt
-# lands as a single initial-prompt argument. Reads GROVE_CONFIG_JSON, so callers
-# must grove_config_load first.
+# grove_prompt_tmpfile <prompt> — write <prompt> to a private temp file (mktemp
+# under $TMPDIR — never inside the worktree, which must stay clean for
+# `wt remove`) and print its path. The launch line built around it deletes the
+# file on read, so it never outlives the hand-off.
+grove_prompt_tmpfile() {
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/grove-prompt.XXXXXX") || return 1
+  printf '%s' "$1" > "$f" || return 1
+  printf '%s' "$f"
+}
+
+# grove_build_launch [prompt-file] — print the shell command cmux types into a
+# new workspace, from the loaded config: agent.command (GROVE_COMMAND overrides;
+# default claude) then the agent.args array, each %q-quoted. With a prompt file,
+# the typed line reads and reclaims it, then hands the content to the agent as a
+# single initial-prompt argument:
+#   p=$(cat -- <file>) && rm -f -- <file> && <cmd> <args...> "$p"
+# cmux *types* this line into a pty whose canonical-mode input buffer caps a
+# line at ~1KB (issue #26) — routing the prompt through a file keeps the typed
+# line short and length-invariant, so prompt size can never truncate the launch.
+# Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
 grove_build_launch() {
-  local prompt="${1:-}" cmd launch a
+  local pfile="${1:-}" cmd launch a
   local args=()
   cmd=$(grove_config_get "agent.command" GROVE_COMMAND); cmd=${cmd:-claude}
   mapfile -t args < <(grove_config_get_array "agent.args")
   launch=$(printf '%q' "$cmd")
   for a in ${args[@]+"${args[@]}"}; do launch+=" $(printf '%q' "$a")"; done
-  [ -n "$prompt" ] && launch+=" $(printf '%q' "$prompt")"
+  if [ -n "$pfile" ]; then
+    local qf; qf=$(printf '%q' "$pfile")
+    launch="p=\$(cat -- $qf) && rm -f -- $qf && $launch \"\$p\""
+  fi
   printf '%s' "$launch"
 }
 
@@ -506,16 +524,26 @@ grove_go() {
     || die "'$branch' is the repo's primary checkout — grove targets linked worktrees"
 
   # 4. Build the command cmux types into the new workspace's shell, from the
-  #    layered config (agent.command + agent.args), then the prompt.
+  #    layered config (agent.command + agent.args). A non-empty prompt goes
+  #    through a temp file the typed line reads-and-reclaims (issue #26) — the
+  #    line stays short no matter how long the prompt is; empty prompt keeps
+  #    the bare-agent launch.
   grove_config_load "$WORKTREE_ROOT"
-  local launch; launch=$(grove_build_launch "$prompt")
+  local launch pfile=""
+  if [ -n "$prompt" ]; then
+    pfile=$(grove_prompt_tmpfile "$prompt") || die "could not write prompt temp file"
+  fi
+  launch=$(grove_build_launch "$pfile")
 
   # 5. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
   local ws
   ws=$(CMUX_QUIET=1 "$CMUX" workspace create \
         --cwd "$wtpath" --name "$branch" --command "$launch" --json \
         | jq -r '.workspace_ref')
-  { [ -n "$ws" ] && [ "$ws" != "null" ]; } || die "cmux workspace create failed"
+  if ! { [ -n "$ws" ] && [ "$ws" != "null" ]; }; then
+    [ -n "$pfile" ] && rm -f -- "$pfile"
+    die "cmux workspace create failed"
+  fi
 
   # 6. File under the repo group; create it (anchor = main checkout) on first use.
   local gid
