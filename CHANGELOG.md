@@ -6,6 +6,19 @@ All notable changes to grove are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- `grove rm` no longer dissolves a cmux group whose **anchor** is the tab being
+  closed (issue #22). The primary-checkout guard assumed the anchor is always
+  the repo-header workspace at the main checkout — true for grove-created
+  groups, but a legacy or UI-created group can be anchored on any member tab,
+  and closing the anchor dissolves the group and orphans its members (cmux
+  contract). `grove rm` now compares the close target against the group's
+  `anchor_workspace_ref` and, on a match, first **re-anchors** the group to the
+  repo header at the main checkout — reusing a member workspace already there,
+  or creating the header as `grove go` does — and verifies the anchor actually
+  moved before closing. If re-anchoring fails, it refuses to close the tab
+  (with a clear warning) rather than dissolve the group.
+
 ### Added
 - `grove go` now **adopts orphaned workspaces** after a group dissolution (issue #23).
   Closing a group's anchor tab dissolves the group but leaves its member workspaces

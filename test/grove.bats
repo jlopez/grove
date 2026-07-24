@@ -497,6 +497,33 @@ _adopt_ws_json() {
 JSON
 }
 
+# --- rm anchor guard (issue #22) ---------------------------------------------
+# Pure matchers behind the anchor guard: grove rm must not close a workspace
+# that still anchors its group (closing the anchor dissolves the group). The
+# jq-only pieces are unit-tested here; the cmux re-anchor calls are manual-only.
+
+_anchor_groups_json() {
+  cat <<'JSON'
+{ "groups": [
+  { "name": "grove", "ref": "workspace_group:7",
+    "anchor_workspace_ref": "workspace:34",
+    "member_workspace_refs": ["workspace:19", "workspace:34"] },
+  { "name": "other", "ref": "workspace_group:9",
+    "anchor_workspace_ref": "workspace:50",
+    "member_workspace_refs": ["workspace:50"] }
+] }
+JSON
+}
+_anchor_ws_json() {
+  cat <<'JSON'
+{ "workspaces": [
+  { "ref": "workspace:19", "title": "grove",     "current_directory": "/repos/grove" },
+  { "ref": "workspace:34", "title": "fix/gh-22", "current_directory": "/repos/wt/fix-gh-22" },
+  { "ref": "workspace:50", "title": "feature/x", "current_directory": "/repos/grove" }
+] }
+JSON
+}
+
 @test "orphan_candidates: lists only workspaces in no group, with their cwd" {
   set +eu
   source "$GROVE"
@@ -602,6 +629,65 @@ JSON
   PATH="$STUB/bin:$PATH" \
     grove_adopt_orphans "$STUB/bin/cmux" myrepo workspace_group:1 "$STUB/repo-main" 2>/dev/null
   [ ! -f "$STUB/adds.log" ]
+}
+
+@test "group_ref: returns the ref of the named group; unknown → empty" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_group_ref "$(_anchor_groups_json)" grove)" = "workspace_group:7" ]
+  [ -z "$(grove_group_ref "$(_anchor_groups_json)" nope)" ]
+}
+
+@test "group_ref: malformed listing → empty, no jq crash" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_group_ref '{}' grove)" ]
+  [ -z "$(grove_group_ref 'not json' grove)" ]
+}
+
+@test "group_anchor_ref: returns the group's anchor workspace ref" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_group_anchor_ref "$(_anchor_groups_json)" grove)" = "workspace:34" ]
+}
+
+@test "group_anchor_ref: unknown group / missing key / malformed → empty" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_group_anchor_ref "$(_anchor_groups_json)" nope)" ]
+  [ -z "$(grove_group_anchor_ref '{ "groups": [ { "name": "grove" } ] }' grove)" ]
+  [ -z "$(grove_group_anchor_ref 'not json' grove)" ]
+}
+
+@test "member_at_cwd: finds the group member at the main checkout" {
+  set +eu
+  source "$GROVE"
+  local r
+  r=$(grove_member_at_cwd "$(_anchor_groups_json)" "$(_anchor_ws_json)" grove /repos/grove workspace:34)
+  [ "$r" = "workspace:19" ]
+}
+
+@test "member_at_cwd: skips the workspace being closed" {
+  set +eu
+  source "$GROVE"
+  # workspace:19 is the only 'grove' member at that cwd; skipping it must yield
+  # empty even though workspace:50 (another group) sits at the same cwd.
+  [ -z "$(grove_member_at_cwd "$(_anchor_groups_json)" "$(_anchor_ws_json)" grove /repos/grove workspace:19)" ]
+}
+
+@test "member_at_cwd: non-member at the cwd never matches (group-scoped)" {
+  set +eu
+  source "$GROVE"
+  # workspace:50 lives at /repos/grove but belongs to 'other', not 'grove'.
+  local ws='{ "workspaces": [ { "ref": "workspace:50", "title": "feature/x", "current_directory": "/repos/grove" } ] }'
+  [ -z "$(grove_member_at_cwd "$(_anchor_groups_json)" "$ws" grove /repos/grove workspace:34)" ]
+}
+
+@test "member_at_cwd: no member at the cwd / malformed listings → empty" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_member_at_cwd "$(_anchor_groups_json)" "$(_anchor_ws_json)" grove /repos/elsewhere workspace:34)" ]
+  [ -z "$(grove_member_at_cwd '{}' '{}' grove /repos/grove workspace:34)" ]
 }
 
 # --- base resolution for new worktrees (issue #14) ---------------------------

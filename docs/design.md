@@ -92,7 +92,9 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
 2. **Primary-checkout guard** — refuse if the branch resolves to the repo's main checkout (the
    group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
    leaves the group intact — only closing the **anchor** dissolves it — so teardown never
-   collapses the sidebar group out from under your other worktrees.
+   collapses the sidebar group out from under your other worktrees. This path guard only covers
+   grove's own invariant (anchor = main-checkout header); the **anchor guard** in step 5 covers
+   groups where that invariant doesn't hold (issue #22).
 3. **Refresh the merge baseline** — fetch just `origin/<default>` (the teardown mirror of
    issue #14's freshness-by-default). `wt`'s merged-branch checks compare against
    `origin/<default>` *as last fetched*, so run right after `gh pr merge -sd` a stale ref would
@@ -114,10 +116,25 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
    `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
    servers/watchers under the worktree before removal). No worktree for the branch → nothing to
    remove.
-5. **Close the cmux workspace** attached to the branch — `grove_attached_workspace_ref` returns
-   the ref (the pure matcher whose boolean face powers the `grove go` gate), then `cmux
+5. **Close the cmux workspace** attached to the branch — `grove_ref_in_group` matches the ref
+   (the pure matcher whose boolean face powers the `grove go` gate), then `cmux
    workspace close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal
    above. A missing or manually-renamed tab yields no ref and is skipped (fails safe).
+
+   **Anchor guard (issue #22).** In a *legacy or UI-created* group the anchor can be any member
+   tab — not the repo header — and closing it would dissolve the group and orphan every other
+   member (the cmux contract above). So before the close, grove compares the target ref against
+   the group's `anchor_workspace_ref` (from the `workspace-group list --json` already fetched
+   for the match). If the target **is** the anchor, `grove_reanchor_group` first moves the
+   anchor to the repo-header workspace at the main checkout, restoring grove's invariant:
+   it reuses a group member whose `current_directory` is the main checkout
+   (`grove_member_at_cwd`, skipping the close target), or — mirroring how `grove go` anchors a
+   fresh group — creates the header workspace (`workspace create --cwd <main-checkout> --name
+   <repo>`) and files it under the group, then runs `workspace-group set-anchor` and
+   **verifies** via a fresh listing that the anchor actually moved. Only then is the tab
+   closed. If any of that fails, `grove rm` refuses to close the tab (warn, not die — the
+   worktree is already removed) rather than dissolve the group; the warning names the manual
+   fix (`cmux workspace-group set-anchor`).
 
 **Safety model (ratifying issue #15).** #15 proposed a GitHub-PR-state merge guard
 (`gh pr view --json state`) because a naive `git branch --merged` reports squash-merged
