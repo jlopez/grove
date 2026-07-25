@@ -313,7 +313,9 @@ grove_env_ref_in_group() {
   [ -n "$path" ] || return 0
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
-    envjson=$(CMUX_QUIET=1 "$cmux" workspace env "$ref" --json 2>/dev/null) || continue
+    # </dev/null: the call must not inherit the loop's ref stream as stdin — a
+    # stdin-draining cmux would silently truncate the sweep to its first member.
+    envjson=$(CMUX_QUIET=1 "$cmux" workspace env "$ref" --json 2>/dev/null </dev/null) || continue
     wpath=$(printf '%s' "$envjson" \
             | jq -r '.env.GROVE_WORKTREE_PATH // empty' 2>/dev/null) || continue
     if [ "$wpath" = "$path" ]; then
@@ -402,7 +404,7 @@ grove_adopt_orphans() {
     canon=$(cd "$dir" 2>/dev/null && pwd -P) || continue
     for p in "${paths[@]}"; do
       [ "$canon" = "$p" ] || continue
-      if CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ref" >/dev/null 2>&1; then
+      if CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ref" >/dev/null 2>&1 </dev/null; then
         info "adopted orphaned workspace ${_c_bld}$ref${_c_rst} into group '$repo'"
       else
         warn "could not adopt orphaned workspace $ref into group '$repo'"
