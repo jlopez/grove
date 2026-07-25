@@ -518,8 +518,12 @@ JSON
 _env_setup() { # populates $ESTUB — a cmux stub serving `workspace env <ref> --json`
   ESTUB="$BATS_TEST_TMPDIR/envstub"
   mkdir -p "$ESTUB/bin"
+  # Every invocation is logged BEFORE any validation, so the no-cmux-call tests
+  # below can assert the log's absence — a stub that merely fails would be
+  # swallowed by the sweep's `|| continue` and prove nothing.
   cat > "$ESTUB/bin/cmux" <<SH
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ESTUB/calls.log"
 [ "\$1 \$2" = "workspace env" ] || exit 1
 cat "$ESTUB/env-\${3//:/-}.json" 2>/dev/null   # no file for a ref → exit 1
 SH
@@ -571,9 +575,11 @@ JSON
 @test "env_ref_in_group: empty canon-path → nothing, and no cmux calls at all" {
   set +eu
   source "$GROVE"
-  # cmux is 'false' — any invocation would fail loudly if the guard didn't
-  # short-circuit; an empty key must not trigger a sweep.
-  [ -z "$(grove_env_ref_in_group false "$(_groups_json)" grove "")" ]
+  _env_setup
+  # An empty key must short-circuit before any sweep: the recording stub proves
+  # cmux was never invoked (calls.log is written on EVERY invocation).
+  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove "")" ]
+  [ ! -e "$ESTUB/calls.log" ]
 }
 
 @test "env_ref_in_group: scoped to the repo group (other group's stamp never matches)" {
@@ -595,10 +601,14 @@ JSON
 @test "workspace_for: title hit returns the ref with zero env sweeps" {
   set +eu
   source "$GROVE"
-  # cmux is 'false': a title hit must never reach the env sweep at all.
+  _env_setup
+  # A title hit must never reach the env sweep: the recording stub proves cmux
+  # was never invoked (a merely-failing stub would be swallowed by the sweep's
+  # `|| continue` and could not distinguish "not called" from "called, failed").
   local r
-  r=$(grove_workspace_for false "$(_groups_json)" "$(_ws_json)" grove "fix/gh-2-reopen-workspace" /repos/wt/renamed)
+  r=$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "fix/gh-2-reopen-workspace" /repos/wt/renamed)
   [ "$r" = "workspace:34" ]
+  [ ! -e "$ESTUB/calls.log" ]
 }
 
 @test "workspace_for: title miss falls back to the env stamp (rename incident)" {
