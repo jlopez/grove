@@ -32,6 +32,22 @@ All notable changes to grove are documented here. Format follows
   (with a clear warning) rather than dissolve the group.
 
 ### Added
+- `grove go` now **stamps grove's identity into each workspace it creates** via
+  per-workspace env (issue #18): `GROVE_WORKTREE_PATH` (canonicalized worktree
+  path — the durable match key), `GROVE_REPO_PATH`, and `GROVE_VERSION`, all
+  inherited by every shell in the tab (usable by user scripts/hooks). The
+  workspace matcher shared by the `grove go` attach gate and `grove rm`'s
+  close-target lookup is now **title-first with an env fallback**: a title hit
+  costs nothing extra, and on a miss grove sweeps the repo group's members'
+  stamped `GROVE_WORKTREE_PATH` (one `cmux workspace env` call each — cmux
+  omits env from `workspace list`). This fixes the orphaned-tab incident where
+  a branch renamed after `grove go` defeated the title match — the tab keeps
+  its creation title but the worktree *path* survives the rename (wt keeps the
+  original dir name), so `grove rm` now still finds and closes the tab, and the
+  attach gate still refuses a duplicate for a manually-renamed tab. Both
+  missing → today's fail-safe behavior, which permanently covers unstamped
+  workspaces (legacy, UI-created, or reused/adopted — env is create-time only,
+  cmux has no post-hoc setter).
 - `grove go` now **adopts orphaned workspaces** after a group dissolution (issue #23).
   Closing a group's anchor tab dissolves the group but leaves its member workspaces
   alive and ungrouped, and recreating the group only attached the newly spawned

@@ -26,13 +26,15 @@ whole dance.
    is already attached to `<branch>`, stop with a clear message. Two orthogonal axes
    drive `grove go`: **cmux** (is a workspace attached?) and **git** (does the branch/
    worktree exist?); they're independent, so the gate is checked first and on its own.
-   The match keys on the workspace **`title`** (grove sets `--name <branch>` at create,
-   so `title == branch`) and is **scoped to the repo group's members** — cross-reference
-   `workspace-group list --json` member refs against `workspace list --json` titles — so
-   a same-named branch in another repo's group never false-matches. No group yet → nothing
-   attached → proceed. *Limitation:* a manual right-click Rename mutates the title and
-   defeats the match (fails safe — you get the error, never a silent duplicate); the real
-   fix is a grove-owned workspace→branch map (issue #18).
+   The match is the **shared matcher** (issue #18; also used by `grove rm`): **title
+   first** — grove sets `--name <branch>` at create, so `title == branch`, and it's
+   **scoped to the repo group's members** (cross-reference `workspace-group list --json`
+   member refs against `workspace list --json` titles), so a same-named branch in another
+   repo's group never false-matches. On a title miss, the **env fallback**: sweep the
+   group's members' stamped `GROVE_WORKTREE_PATH` (see [Workspace identity](#workspace-identity--the-grove_-env-stamp))
+   against the branch's worktree path — which the gate resolves first, read-only, from
+   `wt list` — so a manually-renamed tab no longer defeats the gate. Both missing (or no
+   worktree yet) → nothing attached → proceed. No group yet → same.
 2. **Resolve-or-create the worktree** — by branch/worktree existence:
    worktree exists (`wt list --format json` has a path) → **reuse** it, no `wt switch`;
    branch exists (`git show-ref --verify refs/heads/<branch>`) but no worktree →
@@ -63,7 +65,10 @@ whole dance.
    and the typed line reads and immediately reclaims it:
    `p=$(cat -- <file>) && rm -f -- <file> && claude "$p"` — short and length-invariant, and
    the agent still receives the prompt as a single initial-prompt arg. Empty prompt → bare
-   agent launch.
+   agent launch. The create also **stamps grove's identity into the workspace env**
+   (`--env GROVE_WORKTREE_PATH/GROVE_REPO_PATH/GROVE_VERSION`, issue #18) — create time is
+   the only chance, cmux has no post-hoc env setter; see
+   [Workspace identity](#workspace-identity--the-grove_-env-stamp).
 5. **File it under the repo group** — add to the existing group, or create it on first
    use with the **main checkout as the anchor/header**.
 6. **Adopt orphans** (issue #23) — closing a group's anchor tab *dissolves* the group
@@ -90,7 +95,7 @@ cmux tab can drive cmux back into the same window. Run `grove go` from a cmux ta
 with a feature. It exists because grove owns a bridge nobody else does: the
 **workspace↔branch mapping**. `wt remove` and `wt merge` both know how to drop the *worktree*,
 but they leave the *cmux tab* dangling — only grove knows which tab is attached to which
-branch (the same title-match that powers the `grove go` gate). So `grove rm`:
+branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
 
 1. **Resolve the target branch** — the argument, or the current worktree's branch if omitted
    (mirroring `wt remove`'s "current" default), so `grove rm` from inside the worktree you're
@@ -122,10 +127,16 @@ branch (the same title-match that powers the `grove go` gate). So `grove rm`:
    `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
    servers/watchers under the worktree before removal). No worktree for the branch → nothing to
    remove.
-5. **Close the cmux workspace** attached to the branch — `grove_ref_in_group` matches the ref
-   (the pure matcher whose boolean face powers the `grove go` gate), then `cmux
-   workspace close <ref>`. Done **last**, so closing `grove`'s own tab can't abort the removal
-   above. A missing or manually-renamed tab yields no ref and is skipped (fails safe).
+5. **Close the cmux workspace** attached to the branch — the **shared matcher**
+   (`grove_workspace_for`, issue #18; the same one behind the `grove go` gate) finds the ref,
+   then `cmux workspace close <ref>`. Title match first; on a miss, the env fallback keyed on
+   the stamped `GROVE_WORKTREE_PATH`, compared against the worktree path **canonicalized
+   before step 4 deleted the directory**. That covers the motivating incident: a branch
+   renamed after `grove go` keeps its creation-title tab *and* its original worktree dir name
+   (wt doesn't move it), so the title misses but the path stamp still hits — the tab is
+   closed instead of left orphaned. Done **last**, so closing `grove`'s own tab can't abort
+   the removal above. Both title and stamp missing (legacy/unstamped tab) → no ref, skipped
+   (fails safe).
 
    **Anchor guard (issue #22).** In a *legacy or UI-created* group the anchor can be any member
    tab — not the repo header — and closing it would dissolve the group and orphan every other
@@ -171,12 +182,51 @@ auto-detects it; override with `GROVE_CMUX`). Relevant JSON shapes:
 | `workspace-group create … --json` | `{group: {ref, anchor_workspace_ref, member_workspace_refs, …}}` | `.group.ref` |
 | `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs, custom_color, icon_symbol}]}` | `.groups[] | select(.name==…) | .ref` |
 | `workspace list --json` | `{window_ref, workspaces: [{ref, title, custom_title, current_directory, …}]}` | member `ref` → `title`, for the attach gate (below) and `grove rm`'s close target |
+| `workspace env <ref> --json` | `{count, env: {KEY: VALUE, …}, window_ref, workspace_ref}` | `.env.GROVE_WORKTREE_PATH`, for the shared matcher's env fallback (issue #18) |
 | `workspace close <ref>` | — | — (`grove rm` closes the branch's tab; closing a *member* keeps the group) |
 | `workspace-group add --group <ref> --workspace <ref>` | — | — |
 | `workspace-group set-color <g> --hex #RRGGBB` / `set-icon <g> --symbol <sf>` | — | — (styling; see below) |
 
 `workspace create` flags: `--cwd`, `--name`, `--command` (types text + Enter into the new
 shell), `--env KEY=VALUE`, `--env-file`, `--json`, `--focus`.
+
+### Workspace identity — the `GROVE_*` env stamp
+
+Every workspace `grove go` **creates** is stamped with per-workspace env
+(`workspace create --env`, issue #18). Env persists in cmux's session manifest — it
+survives app restart, daemon restart, and session restore — but is **create-time only**:
+cmux has no post-hoc env setter, so workspaces grove *reused or adopted* (and legacy or
+UI-created tabs) can never be backfilled.
+
+| Var | Value |
+|---|---|
+| `GROVE_WORKTREE_PATH` | canonicalized (`pwd -P`) worktree path — the authoritative match key |
+| `GROVE_REPO_PATH` | canonicalized main-checkout path |
+| `GROVE_VERSION` | grove version that created the workspace (provenance) |
+
+Every shell in the tab inherits these, so they're also usable by user scripts and hooks.
+
+**Why the path, not the branch:** the motivating incident was a branch renamed after
+`grove go` — the tab kept its creation title, so `grove rm`'s title match missed and the
+tab was left orphaned pointing at a deleted worktree. The worktree *path* survives a
+branch rename (wt keeps the original dir name), so the durable key is the path; a
+`GROVE_BRANCH` stamp would be a creation-time copy of a mutable fact — the same staleness
+class as the title bug. Other rejected alternatives: caller-supplied workspace IDs (cmux
+mints its own UUIDs), `--description` (human-facing and user-editable — not machine
+storage), an external ref-map file (violates the self-contained convention).
+
+**The shared matcher** (`grove_workspace_for` — `grove go`'s attach gate and `grove rm`'s
+close-target lookup):
+
+1. **Title match first** (pure, zero extra calls) — under the attach-gate invariant a
+   title hit is always correct.
+2. **On miss: env sweep** — cmux intentionally omits env from `workspace list` (secrets
+   policy), so grove runs one `workspace env <ref> --json` per member of the repo's group
+   (few) and matches `.env.GROVE_WORKTREE_PATH` against the canonical worktree path — for
+   `grove rm`, canonicalized *before* `wt remove` deletes the dir. Fine on a miss path,
+   never for hot loops.
+3. **Both missing: fail-safe no-op** (today's behavior) — permanently covers unstamped
+   workspaces (legacy, UI-created, reused/adopted).
 
 ### Groups, anchors, styling
 
