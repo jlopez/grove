@@ -507,6 +507,128 @@ JSON
   [ -z "$(grove_ref_in_group '{}' '{}' grove "grove")" ]
 }
 
+# --- GROVE_* env stamp matcher (issue #18) -----------------------------------
+# grove_workspace_for is the shared matcher (grove go's attach gate + grove rm's
+# close-target lookup): title first, then a per-member `cmux workspace env`
+# sweep keyed on the stamped GROVE_WORKTREE_PATH. The sweep is exercised with a
+# stubbed cmux serving per-ref env JSON in the real `workspace env --json`
+# shape ({count, env: {...}, window_ref, workspace_ref}); reuses the gate
+# fixtures above (group 'grove' = workspace:19+34, 'other' = workspace:50).
+
+_env_setup() { # populates $ESTUB — a cmux stub serving `workspace env <ref> --json`
+  ESTUB="$BATS_TEST_TMPDIR/envstub"
+  mkdir -p "$ESTUB/bin"
+  # Every invocation is logged BEFORE any validation, so the no-cmux-call tests
+  # below can assert the log's absence — a stub that merely fails would be
+  # swallowed by the sweep's `|| continue` and prove nothing.
+  cat > "$ESTUB/bin/cmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ESTUB/calls.log"
+[ "\$1 \$2" = "workspace env" ] || exit 1
+cat "$ESTUB/env-\${3//:/-}.json" 2>/dev/null   # no file for a ref → exit 1
+SH
+  chmod +x "$ESTUB/bin/cmux"
+  # workspace:19 = unstamped header (empty env, e.g. pre-#18 legacy tab)
+  cat > "$ESTUB/env-workspace-19.json" <<'JSON'
+{ "count": 0, "env": {}, "window_ref": "window:1", "workspace_ref": "workspace:19" }
+JSON
+  # workspace:34 = grove-stamped; title has drifted from its branch
+  cat > "$ESTUB/env-workspace-34.json" <<'JSON'
+{ "count": 3,
+  "env": { "GROVE_WORKTREE_PATH": "/repos/wt/renamed",
+           "GROVE_REPO_PATH": "/repos/grove", "GROVE_VERSION": "0.1.0" },
+  "window_ref": "window:1", "workspace_ref": "workspace:34" }
+JSON
+  # workspace:50 = stamped too, but a member of group 'other', not 'grove'
+  cat > "$ESTUB/env-workspace-50.json" <<'JSON'
+{ "count": 3,
+  "env": { "GROVE_WORKTREE_PATH": "/repos/wt/other-feature",
+           "GROVE_REPO_PATH": "/repos/other", "GROVE_VERSION": "0.1.0" },
+  "window_ref": "window:1", "workspace_ref": "workspace:50" }
+JSON
+}
+
+@test "group_member_refs: lists the repo group's member refs, one per line" {
+  set +eu
+  source "$GROVE"
+  local out; out=$(grove_group_member_refs "$(_groups_json)" grove)
+  [ "$out" = "$(printf 'workspace:19\nworkspace:34')" ]
+}
+
+@test "group_member_refs: unknown group / malformed listing → empty" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_group_member_refs "$(_groups_json)" nope)" ]
+  [ -z "$(grove_group_member_refs '{}' grove)" ]
+  [ -z "$(grove_group_member_refs 'not json' grove)" ]
+}
+
+@test "env_ref_in_group: matches the stamped GROVE_WORKTREE_PATH (skips unstamped)" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # workspace:19 (empty env) is swept first and skipped; workspace:34 matches.
+  local r; r=$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/renamed)
+  [ "$r" = "workspace:34" ]
+}
+
+@test "env_ref_in_group: empty canon-path → nothing, and no cmux calls at all" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # An empty key must short-circuit before any sweep: the recording stub proves
+  # cmux was never invoked (calls.log is written on EVERY invocation).
+  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove "")" ]
+  [ ! -e "$ESTUB/calls.log" ]
+}
+
+@test "env_ref_in_group: scoped to the repo group (other group's stamp never matches)" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # workspace:50 carries this exact stamp but belongs to 'other', not 'grove'.
+  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/other-feature)" ]
+}
+
+@test "env_ref_in_group: failed env read is skipped, no member matches → empty" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  rm "$ESTUB/env-workspace-19.json"   # sweep hits a failing env read first
+  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/nope)" ]
+}
+
+@test "workspace_for: title hit returns the ref with zero env sweeps" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # A title hit must never reach the env sweep: the recording stub proves cmux
+  # was never invoked (a merely-failing stub would be swallowed by the sweep's
+  # `|| continue` and could not distinguish "not called" from "called, failed").
+  local r
+  r=$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "fix/gh-2-reopen-workspace" /repos/wt/renamed)
+  [ "$r" = "workspace:34" ]
+  [ ! -e "$ESTUB/calls.log" ]
+}
+
+@test "workspace_for: title miss falls back to the env stamp (rename incident)" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # The motivating incident: branch renamed after grove go, so no title in the
+  # group matches the new name — but the worktree path survived the rename.
+  local r
+  r=$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "feature/gh-450-renamed" /repos/wt/renamed)
+  [ "$r" = "workspace:34" ]
+}
+
+@test "workspace_for: both title and env miss → empty (fail-safe, legacy tabs)" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  [ -z "$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "feature/nope" /repos/wt/nope)" ]
+}
+
 # --- orphan adoption after group dissolution (issue #23) ---------------------
 # grove_orphan_candidates is the pure half of the adoption sweep: it lists
 # "ref<TAB>cwd" for every workspace in NO group. Fixtures mirror the real

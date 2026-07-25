@@ -257,11 +257,11 @@ grove_title_in_group() {
   [ -n "$(grove_ref_in_group "$1" "$2" "$3" "$4")" ]
 }
 
-# grove_branch_attached <cmux> <repo> <branch> — exit 0 iff a cmux workspace in
-# the repo's group is already attached to <branch>. Boolean face of
+# grove_branch_attached <cmux> <repo> <branch> [canon-path] — exit 0 iff a cmux
+# workspace in the repo's group is already attached to <branch>. Boolean face of
 # grove_attached_workspace_ref; a failed cmux listing yields no ref (exit 1).
 grove_branch_attached() {
-  [ -n "$(grove_attached_workspace_ref "$1" "$2" "$3")" ]
+  [ -n "$(grove_attached_workspace_ref "$@")" ]
 }
 
 # grove_ref_in_group <groups-json> <workspaces-json> <repo> <branch> — print the
@@ -287,14 +287,70 @@ grove_ref_in_group() {
     ' 2>/dev/null
 }
 
-# grove_attached_workspace_ref <cmux> <repo> <branch> — print the ref of the cmux
-# workspace in the repo's group attached to <branch>, or nothing. Fetches the two
-# listings, then delegates to the pure matcher.
+# grove_group_member_refs <groups-json> <repo> — print the member workspace refs
+# of the cmux group named <repo>, one per line. Pure (jq only); unknown group or
+# misshapen listings fail closed to nothing.
+grove_group_member_refs() {
+  printf '%s' "$1" | jq -r --arg n "$2" \
+    '(first((.groups // [])[] | select(.name==$n)) // {})
+     | (.member_workspace_refs // [])[]' 2>/dev/null
+}
+
+# grove_env_ref_in_group <cmux> <groups-json> <repo> <canon-path> — print the
+# ref of the member workspace of cmux group <repo> whose stamped
+# GROVE_WORKTREE_PATH env equals <canon-path>, or nothing. The env fallback of
+# the shared matcher (issue #18): titles are mutable (branch rename, manual tab
+# rename) but the worktree *path* survives both — wt keeps the original dir
+# name on a branch rename — so the create-time env stamp is the durable key.
+# cmux intentionally omits env from `workspace list` (secrets policy), so this
+# costs one `workspace env` call per group member — fine on the title-miss
+# path, never for hot loops. Empty <canon-path> (no worktree resolved) yields
+# nothing without any cmux call; unstamped members (legacy, UI-created, or
+# adopted workspaces — env is create-time-only) and failed env reads are
+# skipped, so both cases degrade to today's fail-safe no-match.
+grove_env_ref_in_group() {
+  local cmux="$1" groups="$2" repo="$3" path="$4" ref envjson wpath
+  [ -n "$path" ] || return 0
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    # </dev/null: the call must not inherit the loop's ref stream as stdin — a
+    # stdin-draining cmux would silently truncate the sweep to its first member.
+    envjson=$(CMUX_QUIET=1 "$cmux" workspace env "$ref" --json 2>/dev/null </dev/null) || continue
+    wpath=$(printf '%s' "$envjson" \
+            | jq -r '.env.GROVE_WORKTREE_PATH // empty' 2>/dev/null) || continue
+    if [ "$wpath" = "$path" ]; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done < <(grove_group_member_refs "$groups" "$repo")
+  return 0
+}
+
+# grove_workspace_for <cmux> <groups-json> <workspaces-json> <repo> <branch>
+# <canon-path> — the shared matcher (issue #18), used by the `grove go` attach
+# gate and `grove rm`'s close-target lookup. Print the ref of the repo-group
+# workspace attached to <branch>, or nothing:
+#   1. title match first (pure, zero extra cmux calls — under the attach-gate
+#      invariant a title hit is always correct);
+#   2. on a miss, the env sweep keyed on the stamped GROVE_WORKTREE_PATH;
+#   3. both missing → empty, i.e. today's fail-safe behavior — permanently
+#      covers legacy/UI-created/adopted workspaces, which carry no stamp.
+grove_workspace_for() {
+  local ref
+  ref=$(grove_ref_in_group "$2" "$3" "$4" "$5")
+  [ -n "$ref" ] || ref=$(grove_env_ref_in_group "$1" "$2" "$4" "$6")
+  printf '%s' "$ref"
+}
+
+# grove_attached_workspace_ref <cmux> <repo> <branch> [canon-path] — print the
+# ref of the cmux workspace in the repo's group attached to <branch>, or
+# nothing. Fetches the two listings, then delegates to the shared matcher
+# (title first, env-stamp fallback when a canon-path is given).
 grove_attached_workspace_ref() {
-  local cmux="$1" repo="$2" branch="$3" groups workspaces
+  local cmux="$1" repo="$2" branch="$3" path="${4:-}" groups workspaces
   groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)   || return 1
   workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)     || return 1
-  grove_ref_in_group "$groups" "$workspaces" "$repo" "$branch"
+  grove_workspace_for "$cmux" "$groups" "$workspaces" "$repo" "$branch" "$path"
 }
 
 # grove_orphan_candidates <groups-json> <workspaces-json> — print one
@@ -348,7 +404,7 @@ grove_adopt_orphans() {
     canon=$(cd "$dir" 2>/dev/null && pwd -P) || continue
     for p in "${paths[@]}"; do
       [ "$canon" = "$p" ] || continue
-      if CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ref" >/dev/null 2>&1; then
+      if CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ref" >/dev/null 2>&1 </dev/null; then
         info "adopted orphaned workspace ${_c_bld}$ref${_c_rst} into group '$repo'"
       else
         warn "could not adopt orphaned workspace $ref into group '$repo'"
@@ -484,18 +540,27 @@ grove_go() {
 
   grove_repo_identity
 
-  # 1. Fail-fast cmux gate (before touching git): if a workspace in this repo's
-  #    group is already attached to <branch>, stop — never spawn a duplicate.
-  if grove_branch_attached "$CMUX" "$REPO" "$branch"; then
+  # 1. Fail-fast cmux gate (before writing anything): if a workspace in this
+  #    repo's group is already attached to <branch>, stop — never spawn a
+  #    duplicate. The branch's existing worktree path is resolved first
+  #    (read-only `wt list`) so the gate's env fallback (issue #18) can key on
+  #    it: a tab whose title drifted (manual rename) no longer defeats the
+  #    gate, because its stamped GROVE_WORKTREE_PATH still matches. No worktree
+  #    yet → empty key → title-only gate, as before.
+  local wtpath canon_gate=""
+  wtpath=$(grove_worktree_path "$branch") || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
+  if [ -n "$wtpath" ]; then
+    canon_gate=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_gate="$wtpath"
+  fi
+  if grove_branch_attached "$CMUX" "$REPO" "$branch" "$canon_gate"; then
     die "a workspace is already attached to '$branch' — close it first, or pick another branch"
   fi
 
   # 2. Resolve-or-create the worktree (git). Three cases, by branch/worktree
-  #    existence (see issue #2). Worktree exists → reuse its path, no `wt switch`;
-  #    branch exists but no worktree → materialize it; neither → create both.
-  #    `wt switch` fires worktrunk pre-start hooks (e.g. multi-account).
-  local wtpath
-  wtpath=$(grove_worktree_path "$branch") || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
+  #    existence (see issue #2), keying on the path the gate already resolved.
+  #    Worktree exists → reuse its path, no `wt switch`; branch exists but no
+  #    worktree → materialize it; neither → create both. `wt switch` fires
+  #    worktrunk pre-start hooks (e.g. multi-account).
   if [ -n "$wtpath" ]; then
     info "reusing existing worktree for '$branch'"
   elif git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$branch"; then
@@ -535,10 +600,20 @@ grove_go() {
   fi
   launch=$(grove_build_launch "$pfile")
 
-  # 5. Spawn the worktree workspace (inherits caller's cmux window via CMUX_* env).
+  # 5. Spawn the worktree workspace (inherits caller's cmux window via CMUX_*
+  #    env), stamping grove's identity into the workspace env (issue #18):
+  #    GROVE_WORKTREE_PATH is the durable key the env-fallback matcher uses
+  #    (titles mutate on branch/tab rename; the canonical worktree path
+  #    survives both), GROVE_REPO_PATH/GROVE_VERSION are provenance. Create
+  #    time is the only chance — cmux has no post-hoc env setter — and every
+  #    shell in the tab inherits the vars (usable by user scripts/hooks).
   local ws
   ws=$(CMUX_QUIET=1 "$CMUX" workspace create \
-        --cwd "$wtpath" --name "$branch" --command "$launch" --json \
+        --cwd "$wtpath" --name "$branch" --command "$launch" \
+        --env "GROVE_WORKTREE_PATH=$canon_wt" \
+        --env "GROVE_REPO_PATH=$canon_repo" \
+        --env "GROVE_VERSION=$GROVE_VERSION" \
+        --json \
         | jq -r '.workspace_ref')
   if ! { [ -n "$ws" ] && [ "$ws" != "null" ]; }; then
     [ -n "$pfile" ] && rm -f -- "$pfile"
@@ -626,7 +701,9 @@ grove_rm() {
   # Primary-checkout guard: never tear down the repo's main checkout (the group's
   # anchor/header). Compare canonicalized paths, as `grove go` does. Removing a
   # *member* leaves the group intact; only closing the anchor dissolves it.
-  local wtpath canon_wt canon_repo
+  # canon_wt outlives this guard: it's the env-fallback match key for the tab
+  # close below, and must be canonicalized NOW — `wt remove` deletes the dir.
+  local wtpath canon_wt="" canon_repo
   wtpath=$(grove_worktree_path "$branch") \
     || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
   if [ -n "$wtpath" ]; then
@@ -677,12 +754,16 @@ grove_rm() {
   fi
 
   # 2. Close the cmux workspace attached to <branch>, if any — LAST, so closing
-  #    grove's own tab can't abort the removal above. A missing/renamed tab just
-  #    yields no ref (fails safe), leaving nothing to close.
+  #    grove's own tab can't abort the removal above. Shared matcher (issue
+  #    #18): title first, then the GROVE_WORKTREE_PATH env stamp — so a tab
+  #    whose branch was renamed after `grove go` (the motivating incident: the
+  #    title keeps the creation name, but the worktree path survives the
+  #    rename) is still found and closed instead of left orphaned. Both
+  #    missing → no ref (fails safe), leaving nothing to close.
   local groups workspaces ws
   groups=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json 2>/dev/null) || groups='{}'
   workspaces=$(CMUX_QUIET=1 "$CMUX" workspace list --json 2>/dev/null)   || workspaces='{}'
-  ws=$(grove_ref_in_group "$groups" "$workspaces" "$REPO" "$branch")
+  ws=$(grove_workspace_for "$CMUX" "$groups" "$workspaces" "$REPO" "$branch" "$canon_wt")
   if [ -n "$ws" ]; then
     # Anchor guard (issue #22). The primary-checkout guard above assumes the
     # group's anchor is the repo-header workspace at the main checkout — true for
@@ -934,6 +1015,11 @@ ${_c_bld}Per-repo agent${_c_rst} (any of the layers above):
 ${_c_bld}Env:${_c_rst}
   GROVE_COMMAND command to launch (overrides agent.command; default: claude)
   GROVE_CMUX    path to the cmux CLI (default: auto-detect)
+
+${_c_bld}Workspace env stamp${_c_rst} (written into each workspace grove go creates):
+  GROVE_WORKTREE_PATH / GROVE_REPO_PATH / GROVE_VERSION — identity stamped at
+  create; every shell in the tab inherits them, and grove's matchers fall back
+  to the worktree path when a tab/branch rename defeats the title match.
 EOF
 }
 
