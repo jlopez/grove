@@ -465,6 +465,49 @@ main, gone from the worktree) is not — nothing disappears.
 removal really is discarding content that exists nowhere else; that deserves a line in the
 scrollback even when it was the intent.
 
+### `grove sync` — the verb
+
+Both halves above only ever fire at `go`/`rm` time, which leaves a gap the lifecycle can't
+close: you add `.env` to the main checkout *after* spawning five agents, and the attach gate
+(flow step 1) rightly refuses to re-run `grove go` for any of them. So the machinery is also
+exposed directly:
+
+```
+grove sync                    # copy missing paths into this worktree (go's step 4)
+grove sync check              # diff vs the main checkout (rm's step 3); exit 1 if any differ
+grove sync list               # each path's config + worktree state
+grove sync add [--local] <p>… # edit .grove.json / .grove.local.json
+grove sync rm  [--local] <p>…
+```
+
+**Subcommands, not flags.** `add`/`rm` take variadic positionals, and a flag that swallows
+positionals is the wrong shape; once those are subcommands, a `--list` alongside them would be
+the worst of both. Bare `grove sync` is the verb (the `git stash` precedent: bare = the common
+action, named = the rest). `copy` is the internal name for the bare form.
+
+`copy` and `check` refuse to run **in the main checkout** — both compare main → worktree, so
+there's no destination distinct from the source. `check`'s exit status is the point of it: it
+composes into scripts and pre-remove hooks.
+
+**The setter is the thin part**, and deliberately so. Unlike `restyle`, whose reason to exist
+is *applying* style to cmux (writing `.grove.json` is a convenience bolted on), `sync.paths`
+has no apply step — so `add`/`rm` ride along on a command that earns its place anyway.
+Two things they do that hand-editing wouldn't:
+
+- **`add` validates.** A **tracked** path is refused outright — unambiguously a mistake, git
+  already carries it. Not-gitignored, or not-yet-existing, only *warn* and still write: you may
+  be about to add the `.gitignore` line or create the file. Silently accepting either would
+  just defer the confusion to the next `grove go`.
+- **`--local` carries the effective list forward.** jq's `*` **replaces** arrays (see
+  [Merge](#merge--nearly-free)), so a `.grove.local.json` holding only the newly added path
+  would silently supersede the committed list. Writing the merged result is the only shape
+  that means what it looks like. Emptying the list deletes the key rather than leaving `[]`.
+
+`grove sync list` and `grove doctor`'s "Synced paths" section are the **same renderer**
+(`grove_sync_list`), with one distinction worth keeping: a *misconfigured* path (unsafe,
+tracked, not ignored) fails the doctor, while mere *divergence* doesn't — that's a state,
+not a config error, and it's what `grove sync check` is for.
+
 ## worktrunk integration
 
 - **Worktree location** is a template: `worktree-path = "~/.worktrunk/worktrees/{{ repo }}/{{ branch | sanitize }}"`.

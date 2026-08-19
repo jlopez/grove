@@ -1045,3 +1045,85 @@ _sync_fixture() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# ---- grove sync (the sync.paths verb) ---------------------------------------
+
+@test "sync -h prints the subcommands" {
+  run "$GROVE" sync -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"list|check|add"* ]]
+}
+
+@test "sync rejects an unknown subcommand" {
+  run "$GROVE" sync frobnicate
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown subcommand"* ]]
+}
+
+@test "sync_list: flags misconfigured paths and returns 1; divergence does not" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": [".env", "loose.txt", ".gitignore", "gone"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  printf 'L\n'   > "$SRC/loose.txt"                    # untracked but not ignored
+  run grove_sync_list "$SRC" "$DST"
+  [ "$status" -eq 1 ]                                  # .gitignore/loose.txt are config errors
+  [[ "$output" == *"differs from the main checkout"* ]] # .env — a state, not an error
+  [[ "$output" == *"not gitignored"* ]]
+  [[ "$output" == *"tracked by git"* ]]
+  [[ "$output" == *"absent from the main checkout"* ]]
+}
+
+@test "sync_list: an in-sync path reads as in sync; no dst → plain ok" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  run grove_sync_list "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"in sync"* ]]
+  run grove_sync_list "$SRC"          # no worktree side → config status only
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"in sync"* ]]
+}
+
+@test "sync_write: add appends, dedupes, and preserves other keys" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "color": "#123456", "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  grove_sync_write "$SRC" "" add ".env.local" ".env"
+  [ "$(jq -r '.color' "$SRC/.grove.json")" = "#123456" ]
+  [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env",".env.local"]' ]
+}
+
+@test "sync_write: rm drops entries, and emptying the list drops the key" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "color": "#123456", "sync": { "paths": [".env", ".env.local"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  grove_sync_write "$SRC" "" rm ".env.local"
+  [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env"]' ]
+  grove_sync_write "$SRC" "" rm ".env"
+  [ "$(jq -r 'has("sync")' "$SRC/.grove.json")" = "false" ]
+  [ "$(jq -r '.color' "$SRC/.grove.json")" = "#123456" ]
+}
+
+@test "sync_write: --local carries the effective list forward (arrays replace)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": [".env", ".env.local"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  grove_sync_write "$SRC" 1 add "mine.txt"
+  # The local layer must restate the committed paths — jq's `*` replaces arrays,
+  # so a one-element local list would silently supersede the shared one.
+  [ "$(jq -c '.sync.paths' "$SRC/.grove.local.json")" = '[".env",".env.local","mine.txt"]' ]
+  [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env",".env.local"]' ]
+}

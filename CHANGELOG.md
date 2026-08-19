@@ -31,6 +31,20 @@ All notable changes to grove are documented here. Format follows
   `node_modules/`), and worktrunk has nowhere to hang the rm-side guard.
   `grove doctor` lists the configured paths, flagging any absent from the main
   checkout, already tracked, or not gitignored.
+- **`grove sync [list|check|add|rm]`** — the same machinery as a verb. Bare
+  `grove sync` copies the missing paths into *this* worktree, covering the case
+  `grove go` structurally can't: you add `.env` to the main checkout after
+  spawning five agents, and the attach gate rightly refuses to re-run `grove go`
+  for any of them. `check` runs `grove rm`'s guard on demand and **exits 1** on
+  divergence, so it composes into scripts and hooks. `list` reports each path's
+  config *and* worktree state (in sync / not copied yet / differs), and is the
+  same renderer `grove doctor` uses. `add`/`rm [--local] <path>...` edit
+  `.grove.json` (or `.grove.local.json`) so hand-editing a JSON array is
+  optional, mirroring what `restyle --color` does for styling: `add` refuses a
+  tracked path outright and warns-but-writes on one that isn't gitignored or
+  doesn't exist yet, and `--local` **carries the effective list forward** rather
+  than writing a one-element array that would silently supersede the committed
+  one (jq's `*` replaces arrays).
 
 ### Fixed
 - `grove go` now delivers the prompt to the agent **via a temp file** instead of
