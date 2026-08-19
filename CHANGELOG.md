@@ -6,6 +6,32 @@ All notable changes to grove are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- **`sync.paths` — untracked files carried into worktrees, and guarded on the way
+  out.** A new config key (any layer) names repo-relative gitignored paths —
+  `{ "sync": { "paths": [".env", ".env.local"] } }` — that every worktree needs but
+  git never carries. `grove go` copies them from the main checkout into the new
+  worktree before the workspace is created, so the agent's first command already
+  sees them. An existing file in the worktree is **never overwritten** (a reused
+  worktree keeps its own), and only **gitignored** paths are synced — a tracked path
+  is already carried by git, and copying an untracked-but-not-ignored one would
+  leave the worktree dirty and make `wt remove` refuse. Absent sources and unsafe
+  entries warn and are skipped, never fatal.
+
+  The other half is teardown: `.env` lives only on disk, so git can't preserve it
+  and `wt remove`'s dirty-tree refusal is structurally blind to it (it's
+  gitignored, therefore never "dirty"). So `grove rm` now diffs each synced path
+  against the main checkout **before** removing anything and refuses if any
+  differs, printing a **colored `git diff`** per path — enough to judge "I don't
+  care about that line" and re-run with `--force`, which removes anyway but keeps
+  a one-line warning per diverged path. The check is deliberately stateless: it
+  compares against the main checkout rather than a hash recorded at copy time, so
+  there's no state file to manage and a rotated `.env` in main also surfaces.
+  Deliberately *not* `wt step copy-ignored` (a deny-list that would drag
+  `node_modules/`), and worktrunk has nowhere to hang the rm-side guard.
+  `grove doctor` lists the configured paths, flagging any absent from the main
+  checkout, already tracked, or not gitignored.
+
 ### Fixed
 - `grove go` now delivers the prompt to the agent **via a temp file** instead of
   inlining it in the typed launch command (issue #26). cmux *types* the launch

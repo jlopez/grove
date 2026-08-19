@@ -58,7 +58,11 @@ whole dance.
    group's anchor/header), stop: grove targets *linked* worktrees, not the header. Paths
    are canonicalized before comparison. Often redundant with `wt switch`'s own refusal,
    but a clean message beats a raw `wt` error.
-4. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command <launch> --json`.
+4. **Sync the untracked paths** (`sync.paths`) — copy the configured gitignored files/dirs
+   from the main checkout into the worktree, *before* the workspace exists so the agent's
+   first command already sees them. See
+   [Synced untracked paths](#synced-untracked-paths--syncpaths) below.
+5. **Spawn the workspace** — `cmux workspace create --cwd <wt> --command <launch> --json`.
    cmux *types* the launch line into the new pty, whose canonical-mode input buffer caps a
    line at ~1KB — so the prompt never rides the line itself (issue #26). A non-empty prompt
    is written to a private `mktemp` file outside the worktree (kept clean for `wt remove`),
@@ -69,9 +73,9 @@ whole dance.
    (`--env GROVE_WORKTREE_PATH/GROVE_REPO_PATH/GROVE_VERSION`, issue #18) — create time is
    the only chance, cmux has no post-hoc env setter; see
    [Workspace identity](#workspace-identity--the-grove_-env-stamp).
-5. **File it under the repo group** — add to the existing group, or create it on first
+6. **File it under the repo group** — add to the existing group, or create it on first
    use with the **main checkout as the anchor/header**.
-6. **Adopt orphans** (issue #23) — closing a group's anchor tab *dissolves* the group
+7. **Adopt orphans** (issue #23) — closing a group's anchor tab *dissolves* the group
    but its member workspaces survive **ungrouped**, and recreating the group only
    attaches the new spawn (the matchers are deliberately group-scoped). So once the
    group is ensured, sweep `workspace list --json` for workspaces in **no** group whose
@@ -104,16 +108,21 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
    leaves the group intact — only closing the **anchor** dissolves it — so teardown never
    collapses the sidebar group out from under your other worktrees. This path guard only covers
-   grove's own invariant (anchor = main-checkout header); the **anchor guard** in step 5 covers
+   grove's own invariant (anchor = main-checkout header); the **anchor guard** in step 6 covers
    groups where that invariant doesn't hold (issue #22).
-3. **Refresh the merge baseline** — fetch just `origin/<default>` (the teardown mirror of
+3. **Synced-path guard** (`sync.paths`) — refuse the teardown while any synced untracked path
+   differs from the main checkout, printing a colored `git diff` per path. This is the half of
+   the feature that can't live in worktrunk: `.env` is gitignored, so `wt remove`'s dirty-tree
+   refusal is structurally blind to it, and deleting the worktree would take an edited secret
+   with it silently. See [Synced untracked paths](#synced-untracked-paths--syncpaths).
+4. **Refresh the merge baseline** — fetch just `origin/<default>` (the teardown mirror of
    issue #14's freshness-by-default). `wt`'s merged-branch checks compare against
    `origin/<default>` *as last fetched*, so run right after `gh pr merge -sd` a stale ref would
    make the just-squash-merged branch look unmerged and leak it. `--no-fetch` opts out; a
    failed fetch warns and proceeds (worst case the branch is kept, never lost).
-4. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
+5. **Remove the worktree** — delegate to `wt remove <branch> -y`, which is **safe by default**:
    it *"Remove[s the] worktree; delete[s the] branch if merged"*, and **refuses a dirty
-   worktree** without `-f`. This runs **before** the tab is closed (step 4): `grove rm` is meant
+   worktree** without `-f`. This runs **before** the tab is closed (step 6): `grove rm` is meant
    to be run from inside the worktree's *own* tab, and closing that tab first could kill `grove`
    before `wt remove` ran — the inverse of the command's purpose. wt renames the worktree out and
    deletes the branch synchronously (only the final `rm -rf` is detached — *"Removal runs in the
@@ -127,11 +136,11 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
    servers/watchers under the worktree before removal). No worktree for the branch → nothing to
    remove.
-5. **Close the cmux workspace** attached to the branch — the **shared matcher**
+6. **Close the cmux workspace** attached to the branch — the **shared matcher**
    (`grove_workspace_for`, issue #18; the same one behind the `grove go` gate) finds the ref,
    then `cmux workspace close <ref>`. Title match first; on a miss, the env fallback keyed on
    the stamped `GROVE_WORKTREE_PATH`, compared against the worktree path **canonicalized
-   before step 4 deleted the directory**. That covers the motivating incident: a branch
+   before step 5 deleted the directory**. That covers the motivating incident: a branch
    renamed after `grove go` keeps its creation-title tab *and* its original worktree dir name
    (wt doesn't move it), so the title misses but the path stamp still hits — the tab is
    closed instead of left orphaned. Done **last**, so closing `grove`'s own tab can't abort
@@ -370,6 +379,91 @@ array, `printf %q`-quoting each token into the command cmux types; the prompt it
 via a read-and-reclaimed temp file, not the typed line (issue #26). `grove
 doctor` resolves the same `agent.command` to decide which binary to probe, instead of a
 hardcoded `claude`.
+
+**Third consumer:** `sync.paths` (below) — the first pure-array key, read with
+`grove_config_get_array`. Worth noting what the merge semantics mean for it: jq's `*`
+**replaces** arrays, so a `sync.paths` in `.grove.local.json` *supersedes* the committed one
+rather than appending to it. That's uniform with every other key (last layer wins) and needs
+no special case; the cost is that a personal extra path means restating the shared list. A
+concat-for-this-one-key exception was considered and rejected — an inconsistent merge rule is
+worse to reason about than a restated array.
+
+## Synced untracked paths — `sync.paths`
+
+Some files every worktree needs are exactly the ones git refuses to carry: `.env`,
+`.env.local`, `.claude/settings.local.json`. A fresh worktree starts without them, and the
+agent's first command fails on a missing secret. `sync.paths` is an **allow-list** of
+repo-relative gitignored paths that `grove go` copies from the main checkout into the new
+worktree (step 4), and that `grove rm` diffs against the main checkout before teardown
+(step 3).
+
+**Why not worktrunk.** worktrunk already ships `wt step copy-ignored` and `pre-start` hooks,
+and either could do the *copy*. Neither fits:
+
+- `copy-ignored` is a **deny-list, all-or-nothing** sweep of everything gitignored — you'd
+  have to enumerate `node_modules/`, `.venv/`, `dist/`, `target/`… as exclusions to get the
+  three files you actually wanted. The allow-list is the different (and much smaller) ask.
+- Neither knows anything at **`wt remove` time**. The guard is the point of the feature, and
+  worktrunk has nowhere to hang it. grove owns both `go` and `rm`, so the pair stays
+  symmetric here.
+
+The one thing this design *can't* do that a `pre-start` hook can: run **before** worktrunk's
+own hooks. grove copies after `wt switch` returns, so a `post-start` hook that itself needs
+`.env` (docker, mise) must still be handled inside worktrunk. That's the honest boundary.
+
+### Copy side (`grove_sync_copy`)
+
+Three rules, each a deliberate failure-mode choice:
+
+- **Never overwrite an existing destination.** The worktree's own copy always wins. This is
+  what makes the reuse case (`grove go` on an existing worktree, flow step 2) safe — it fills
+  gaps instead of clobbering a deliberately-diverged `.env` — without branching on how the
+  worktree came to exist.
+- **Sync only gitignored paths.** The disqualifier is *anything git would notice*: a tracked
+  file is already carried by git, and an untracked-but-not-ignored one would land in the
+  worktree as an untracked file — and a dirty worktree makes `wt remove` refuse, so a
+  convenience quietly becomes a teardown blocker. `git check-ignore -q` is the real gate;
+  `git ls-files -- <path>` runs first only to diagnose the tracked case separately (it also
+  answers correctly for directories, listing any tracked file underneath).
+- **Nothing here is fatal.** An absent source (a fresh clone has no `.env`), an unsafe entry
+  (absolute or `..`-escaping), a failed `cp` — each warns and continues. A half-synced worktree
+  still beats no worktree; the agent's error message about the missing file is clearer than
+  grove refusing to spawn.
+
+### Guard side (`grove_sync_check`)
+
+**Stateless by design.** The alternative — hash each file at copy time and compare at removal
+— needs somewhere to keep the hashes: inside the worktree dirties it, outside it (`~/.local/
+state/…`) adds a lifecycle to manage and leaks on every manual `wt remove`. And it answers the
+narrower question. Comparing against the **main checkout** needs no state at all, and its one
+"false positive" — main rotated its `.env` after the copy — is information you want before
+deleting the only other copy.
+
+Divergence is reported as a **colored `git diff --no-index`** per path, so the decision
+("I don't care about that one line") can be made without leaving the terminal:
+
+```
+grove: sync: .env differs from the main checkout (- main, + worktree):
+@@ -1,3 +1,4 @@
+ API_KEY=abc
+-PORT=3000
++PORT=3001
++EXTRA=yes
+```
+
+`--no-index` is required (both sides are gitignored, so the index knows nothing about them)
+and exits 1 on difference, hence the `|| true`. git's file headers (`diff --git`, `index`,
+`---`/`+++`) are stripped — they carry absolute paths and the line above already names the
+file — by matching each line against a **color-stripped copy** of itself in `awk`, so the
+printed line keeps its ANSI attributes. Output is capped at 40 lines per path.
+
+A path present in the worktree but **absent from the main checkout** is divergence too: there
+is nothing to fall back on, so it's the case with the most to lose. The inverse (present in
+main, gone from the worktree) is not — nothing disappears.
+
+`--force` doesn't silence the finding, it downgrades it to a one-line warning per path. The
+removal really is discarding content that exists nowhere else; that deserves a line in the
+scrollback even when it was the intent.
 
 ## worktrunk integration
 

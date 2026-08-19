@@ -148,6 +148,119 @@ grove_build_launch() {
   printf '%s' "$launch"
 }
 
+# ---- synced untracked paths -------------------------------------------------
+# `sync.paths` is an allow-list of gitignored files/dirs (.env & friends) that
+# every worktree needs but git never carries: `grove go` copies them from the
+# main checkout into the worktree, and `grove rm` refuses to tear the worktree
+# down while one of them differs from the main checkout — so a secret written
+# only inside the worktree isn't deleted unseen. Three deliberate rules:
+#   * an existing destination is never overwritten — the worktree's own copy
+#     always wins, so `grove go` on a reused worktree fills gaps, never clobbers;
+#   * only *gitignored* paths are synced — anything else (tracked, or merely
+#     untracked) would leave the worktree dirty in git's eyes and make
+#     `wt remove` refuse, turning a convenience into a teardown blocker;
+#   * the rm-side check is stateless: it compares against the main checkout
+#     rather than a hash recorded at copy time, so there's no state file whose
+#     lifecycle to manage, and "main rotated its .env" also surfaces as
+#     divergence — which is exactly what you want to see before deleting.
+# This is deliberately *not* `wt step copy-ignored` (deny-list, all-or-nothing:
+# it would drag node_modules/), and worktrunk has nowhere to hang the rm-side
+# guard — grove owns both ends of the lifecycle, so the pair lives here.
+
+# grove_sync_path_ok <path> — true if <path> is a safe repo-relative subpath
+# (no absolute paths, no `..` escape out of the worktree).
+grove_sync_path_ok() {
+  case "$1" in
+    ''|/*)                return 1 ;;
+    ..|../*|*/..|*/../*)  return 1 ;;
+  esac
+  return 0
+}
+
+# grove_sync_copy <src-root> <dst-root> — copy every configured sync.path that
+# is missing under <dst-root> from <src-root>. Missing sources, tracked paths
+# and unsafe entries are reported and skipped, never fatal: a fresh clone
+# legitimately has no .env, and a half-synced worktree still beats no worktree.
+# Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
+grove_sync_copy() {
+  local src="$1" dst="$2" p
+  local paths=() copied=() missing=() tracked=() unignored=()
+  mapfile -t paths < <(grove_config_get_array "sync.paths")
+  [ ${#paths[@]} -gt 0 ] || return 0
+  for p in "${paths[@]}"; do
+    if ! grove_sync_path_ok "$p"; then
+      warn "sync.paths: ignoring '$p' — must be a relative path inside the repo"
+      continue
+    fi
+    [ -e "$src/$p" ] || { missing+=("$p"); continue; }
+    # Tracked and merely-untracked are both disqualifying (a copied untracked
+    # file makes the worktree dirty just as surely), but they're different
+    # mistakes, so they're diagnosed separately. `ls-files <path>` also answers
+    # for directories: it lists any tracked file underneath.
+    [ -n "$(git -C "$src" ls-files -- "$p" 2>/dev/null)" ] && { tracked+=("$p"); continue; }
+    git -C "$src" check-ignore -q -- "$p" 2>/dev/null || { unignored+=("$p"); continue; }
+    [ -e "$dst/$p" ] && continue          # never overwrite — the worktree's copy wins
+    mkdir -p -- "$(dirname -- "$dst/$p")" 2>/dev/null \
+      || { warn "sync.paths: could not create the parent directory for '$p'"; continue; }
+    if cp -Rp -- "$src/$p" "$dst/$p" 2>/dev/null; then
+      copied+=("$p")
+    else
+      warn "sync.paths: could not copy '$p' from the main checkout"
+    fi
+  done
+  [ ${#copied[@]}  -gt 0 ] && info "synced from the main checkout: ${copied[*]}"
+  [ ${#missing[@]} -gt 0 ] && warn "sync.paths absent from the main checkout (skipped): ${missing[*]}"
+  [ ${#tracked[@]} -gt 0 ] && warn "sync.paths tracked by git (skipped — git already carries them): ${tracked[*]}"
+  [ ${#unignored[@]} -gt 0 ] && warn "sync.paths not gitignored (skipped — copying would leave the worktree dirty and block 'wt remove'): ${unignored[*]}"
+  return 0
+}
+
+# grove_sync_check <src-root> <dst-root> [quiet] — compare every configured
+# sync.path in <dst-root> against <src-root>. Returns 1 if any diverged, 0
+# otherwise (including "nothing configured"). Divergence is reported on stderr
+# with a colored `git diff` per path — enough to judge "I don't care about that
+# one line" and re-run with --force; a non-empty <quiet> prints the one-line
+# summary only (the --force path, where the diff would just be noise).
+# Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
+grove_sync_check() {
+  local src="$1" dst="$2" quiet="${3:-}" p d diverged=0
+  local paths=() color=never max=40
+  mapfile -t paths < <(grove_config_get_array "sync.paths")
+  [ ${#paths[@]} -gt 0 ] || return 0
+  [ -t 2 ] && color=always
+  for p in "${paths[@]}"; do
+    grove_sync_path_ok "$p" || continue
+    [ -e "$dst/$p" ] || continue          # already gone from the worktree → nothing to lose
+    if [ ! -e "$src/$p" ]; then
+      diverged=1
+      warn "sync: ${_c_bld}$p${_c_rst} exists in the worktree but not in the main checkout"
+      continue
+    fi
+    # --no-index diffs plain paths (both are gitignored, so the index knows
+    # nothing about them); it exits 1 on difference, hence the `|| true`.
+    d=$(git --no-pager diff --no-index --no-ext-diff "--color=$color" \
+          -- "$src/$p" "$dst/$p" 2>/dev/null) || true
+    [ -n "$d" ] || continue
+    diverged=1
+    if [ -n "$quiet" ]; then
+      warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout"
+      continue
+    fi
+    warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout (- main, + worktree):"
+    # Drop git's file headers — the absolute paths are long and the line above
+    # already names the file. The match is made on a color-stripped copy of each
+    # line so the printed line keeps its ANSI attributes.
+    printf '%s\n' "$d" \
+      | awk -v e=$'\033' '{ l=$0; gsub(e "\\[[0-9;]*m", "", l)
+          if (l ~ /^(diff --git |index |--- |\+\+\+ |old mode |new mode )/) next
+          print }' \
+      | head -n "$max" >&2
+    [ "$(printf '%s\n' "$d" | wc -l)" -gt "$max" ] \
+      && printf '    %s… diff truncated%s\n' "$_c_dim" "$_c_rst" >&2
+  done
+  return $diverged
+}
+
 # ---- group styling ----------------------------------------------------------
 # 48-cell OKLCH palette: 24 hues × 2 lightness tiers (L≈0.74 / 0.62, C≈0.13),
 # generated offline and gamut-fitted so every cell clears contrast on both light
@@ -588,19 +701,25 @@ grove_go() {
   [ "$canon_wt" != "$canon_repo" ] \
     || die "'$branch' is the repo's primary checkout — grove targets linked worktrees"
 
-  # 4. Build the command cmux types into the new workspace's shell, from the
+  # 4. Sync the untracked paths git can't carry (sync.paths — .env & friends)
+  #    from the main checkout into the worktree, BEFORE the workspace is created
+  #    so the agent's very first command already sees them. Existing files are
+  #    never overwritten, so a reused worktree (G2) keeps its own.
+  grove_config_load "$WORKTREE_ROOT"
+  grove_sync_copy "$canon_repo" "$wtpath"
+
+  # 5. Build the command cmux types into the new workspace's shell, from the
   #    layered config (agent.command + agent.args). A non-empty prompt goes
   #    through a temp file the typed line reads-and-reclaims (issue #26) — the
   #    line stays short no matter how long the prompt is; empty prompt keeps
   #    the bare-agent launch.
-  grove_config_load "$WORKTREE_ROOT"
   local launch pfile=""
   if [ -n "$prompt" ]; then
     pfile=$(grove_prompt_tmpfile "$prompt") || die "could not write prompt temp file"
   fi
   launch=$(grove_build_launch "$pfile")
 
-  # 5. Spawn the worktree workspace (inherits caller's cmux window via CMUX_*
+  # 6. Spawn the worktree workspace (inherits caller's cmux window via CMUX_*
   #    env), stamping grove's identity into the workspace env (issue #18):
   #    GROVE_WORKTREE_PATH is the durable key the env-fallback matcher uses
   #    (titles mutate on branch/tab rename; the canonical worktree path
@@ -620,7 +739,7 @@ grove_go() {
     die "cmux workspace create failed"
   fi
 
-  # 6. File under the repo group; create it (anchor = main checkout) on first use.
+  # 7. File under the repo group; create it (anchor = main checkout) on first use.
   local gid
   gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
         | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
@@ -631,14 +750,14 @@ grove_go() {
             --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
   fi
 
-  # 7. Adopt orphans (issue #23): if this repo's group was dissolved (anchor tab
+  # 8. Adopt orphans (issue #23): if this repo's group was dissolved (anchor tab
   #    closed), its surviving workspaces are ungrouped and invisible to the
   #    group-scoped matchers — re-attach any whose cwd is one of this repo's
   #    worktrees, so a `grove go` self-heals the sidebar instead of stranding them.
   { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
     && grove_adopt_orphans "$CMUX" "$REPO" "$gid" "$canon_repo"
 
-  # 8. Reconcile group styling from this worktree's .grove.json (deterministic
+  # 9. Reconcile group styling from this worktree's .grove.json (deterministic
   #    color by default).
   { [ -n "$gid" ] && [ "$gid" != "null" ]; } \
     && grove_apply_style "$CMUX" "$gid" "$REPO" "$WORKTREE_ROOT"
@@ -711,6 +830,23 @@ grove_rm() {
     canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P) || canon_repo="$REPO_PATH"
     [ "$canon_wt" != "$canon_repo" ] \
       || die "'$branch' is the repo's primary checkout — grove rm targets linked worktrees"
+  fi
+
+  # 0. Synced-path guard (sync.paths). The worktree is about to be deleted and
+  #    .env & friends live only on disk: git can't preserve them, and wt's
+  #    dirty-tree refusal can't see them (they're gitignored, so they're never
+  #    "dirty"). So diff each configured path against the main checkout and
+  #    refuse on divergence, printing the diff — enough to judge "I don't care
+  #    about that line" and re-run with --force. --force doesn't silence the
+  #    finding, it just downgrades it to a one-line warning: the removal is
+  #    still discarding content that exists nowhere else.
+  if [ -n "$wtpath" ]; then
+    grove_config_load "$WORKTREE_ROOT"
+    if ! grove_sync_check "$canon_repo" "$wtpath" "$opt_force"; then
+      [ -n "$opt_force" ] \
+        || die "synced paths differ from the main checkout (above) — copy what you need, then re-run 'grove rm --force'"
+      warn "--force: removing anyway — the divergence above is discarded"
+    fi
   fi
 
   # 1. Remove the worktree (git) FIRST, delegating to wt's safe defaults (it
@@ -872,6 +1008,36 @@ grove_doctor() {
                                 "wt config plugins claude install"
   _chk "wt go alias"            "wt config show 2>/dev/null | grep -qE '^\s*go\s*='" \
                                 "grove init"
+
+  # Configured sync.paths, with the setup mistakes called out: a path that
+  # doesn't exist in the main checkout (nothing to copy), one git already tracks,
+  # and one that isn't gitignored (grove refuses both — a copy would leave the
+  # worktree dirty and block `wt remove`).
+  local sync_paths=() p main=""
+  mapfile -t sync_paths < <(grove_config_get_array "sync.paths")
+  if [ ${#sync_paths[@]} -gt 0 ]; then
+    main=$(git rev-parse --git-common-dir 2>/dev/null) && main=$(dirname "$(cd "$main" && pwd)")
+    printf '\n%sSynced paths%s %s(from %s)%s\n' \
+      "$_c_bld" "$_c_rst" "$_c_dim" "${main:-?}" "$_c_rst"
+    for p in "${sync_paths[@]}"; do
+      if ! grove_sync_path_ok "$p"; then
+        printf '  %s✗%s %s %s(must be a relative path inside the repo)%s\n' \
+          "$_c_red" "$_c_rst" "$p" "$_c_dim" "$_c_rst"; ok=1
+      elif [ -z "$main" ] || [ ! -e "$main/$p" ]; then
+        printf '  %s!%s %s %s(absent from the main checkout — nothing to copy)%s\n' \
+          "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
+      elif [ -n "$(git -C "$main" ls-files -- "$p" 2>/dev/null)" ]; then
+        printf '  %s✗%s %s %s(tracked by git — git already carries it)%s\n' \
+          "$_c_red" "$_c_rst" "$p" "$_c_dim" "$_c_rst"; ok=1
+      elif ! git -C "$main" check-ignore -q -- "$p" 2>/dev/null; then
+        printf '  %s✗%s %s %s(not gitignored — a copy would leave the worktree dirty)%s\n' \
+          "$_c_red" "$_c_rst" "$p" "$_c_dim" "$_c_rst"; ok=1
+      else
+        printf '  %s✓%s %s\n' "$_c_grn" "$_c_rst" "$p"
+      fi
+    done
+  fi
+
   [ -n "${CMUX_WORKSPACE_ID:-}" ] \
     && printf '\n%s✓ running inside cmux%s (window targeting works)\n' "$_c_grn" "$_c_rst" \
     || printf '\n%s!%s not inside a cmux workspace — %sgrove go%s targets cmux best when run from a cmux tab\n' \
@@ -1011,6 +1177,15 @@ ${_c_bld}Per-repo styling${_c_rst} (any of the layers above):
 ${_c_bld}Per-repo agent${_c_rst} (any of the layers above):
   agent.command  executable to launch (default: claude; env GROVE_COMMAND wins)
   agent.args     array of argv tokens passed before the prompt (default: none)
+
+${_c_bld}Synced untracked paths${_c_rst} (any of the layers above):
+  sync.paths     array of repo-relative gitignored files/dirs (e.g. [".env"])
+                 copied from the main checkout into each new worktree. An
+                 existing file is never overwritten, and a git-tracked path is
+                 refused. Before removing a worktree, 'grove rm' diffs each one
+                 against the main checkout and refuses if any differs — so a
+                 secret written only in the worktree is never deleted unseen;
+                 --force removes anyway.
 
 ${_c_bld}Env:${_c_rst}
   GROVE_COMMAND command to launch (overrides agent.command; default: claude)

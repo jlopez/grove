@@ -73,6 +73,42 @@ personal). Files deep-merge, last layer wins per key. This drives the per-repo g
 `claude`, `args` is an array of argv tokens passed before the prompt). `grove init`
 gitignores `.grove.local.json`.
 
+### Synced untracked paths (`.env` & friends)
+
+Some files every worktree needs are exactly the ones git never carries. List them and
+grove copies them from the main checkout into each new worktree:
+
+```json
+{ "sync": { "paths": [".env", ".env.local", ".claude/settings.local.json"] } }
+```
+
+An allow-list, not `wt step copy-ignored`'s deny-list — nothing drags `node_modules/` along.
+An existing file in the worktree is **never overwritten** (yours wins), and only **gitignored**
+paths are synced — a tracked path is already carried by git, and copying an untracked-but-not-
+ignored file would leave the worktree dirty and make `wt remove` refuse.
+
+The other half is teardown. `.env` lives only on disk, so git can't preserve it and wt's
+dirty-tree check can't even see it — deleting the worktree would take an edited secret with
+it, silently. So `grove rm` diffs each synced path against the main checkout first and
+**refuses if any differs**, printing a colored diff:
+
+```
+grove: sync: .env differs from the main checkout (- main, + worktree):
+@@ -1,3 +1,4 @@
+ API_KEY=abc
+-PORT=3000
++PORT=3001
++EXTRA=yes
+grove: synced paths differ from the main checkout (above) — copy what you need,
+       then re-run 'grove rm --force'
+```
+
+Look at it, decide you don't care, `grove rm -f`. The check is stateless — it compares
+against the main checkout rather than a hash taken at copy time — so a rotated `.env` in
+main shows up as divergence too, which is what you want to see before deleting. `grove
+doctor` lists the configured paths and flags any that are absent from the main checkout,
+already tracked, or not gitignored.
+
 ### Multi-account `gh` in worktrees
 
 If you use [direnv](https://direnv.net) to switch `gh` accounts per directory (e.g. `export GH_CONFIG_DIR=…`), worktrees created outside those directories lose the account. `grove init --with-multi-account` installs a worktrunk `pre-start` hook that asks the **main checkout's** direnv what it resolves and writes a matching `.envrc` into each new worktree — no mapping tables, no drift. It's a no-op for repos that don't use direnv.

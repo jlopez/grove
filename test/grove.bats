@@ -903,3 +903,145 @@ JSON
   grove_resolve_style "styleover" "$d"
   [ "$STYLE_COLOR" = "#999999" ]
 }
+
+# ---- sync.paths (untracked files carried into worktrees) --------------------
+
+# A main checkout + a worktree-shaped sibling dir, with sync.paths configured on
+# the source side (grove_config_load reads whichever root it's given).
+_sync_fixture() {
+  SRC="$BATS_TEST_TMPDIR/sync-main"; DST="$BATS_TEST_TMPDIR/sync-wt"
+  mkdir -p "$SRC" "$DST"
+  git -C "$SRC" init -q -b main
+  printf '%s\n' '.env' '.env.local' 'cfg/' > "$SRC/.gitignore"
+  git -C "$SRC" add .gitignore
+  git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm init
+  printf '%s\n' '{ "sync": { "paths": [".env", ".env.local", "cfg/keys"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+}
+
+@test "sync_path_ok: rejects absolute paths and .. escapes" {
+  set +eu
+  source "$GROVE"
+  grove_sync_path_ok ".env"
+  grove_sync_path_ok "cfg/keys/id"
+  ! grove_sync_path_ok ""
+  ! grove_sync_path_ok "/etc/passwd"
+  ! grove_sync_path_ok "../outside"
+  ! grove_sync_path_ok "cfg/../../outside"
+}
+
+@test "sync_copy: copies files and dirs, creating missing parents" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'SECRET=1\n' > "$SRC/.env"
+  mkdir -p "$SRC/cfg/keys"; printf 'k\n' > "$SRC/cfg/keys/id"
+  grove_sync_copy "$SRC" "$DST"
+  [ "$(cat "$DST/.env")" = "SECRET=1" ]
+  [ "$(cat "$DST/cfg/keys/id")" = "k" ]
+}
+
+@test "sync_copy: never overwrites an existing destination" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'FROM_MAIN\n' > "$SRC/.env"
+  printf 'MINE\n'      > "$DST/.env"
+  grove_sync_copy "$SRC" "$DST"
+  [ "$(cat "$DST/.env")" = "MINE" ]
+}
+
+@test "sync_copy: skips a path that isn't gitignored (it would dirty the worktree)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": ["loose.txt"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"
+  printf 'LOOSE\n' > "$SRC/loose.txt"        # untracked, but not ignored either
+  run grove_sync_copy "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ ! -e "$DST/loose.txt" ]
+  [[ "$output" == *"not gitignored"* ]]
+}
+
+@test "sync_copy: skips a tracked path (git already carries it)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'TRACKED\n' > "$SRC/.env"
+  git -C "$SRC" add -f .env
+  git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm env
+  grove_sync_copy "$SRC" "$DST" 2>/dev/null
+  [ ! -e "$DST/.env" ]
+}
+
+@test "sync_copy: an absent source is skipped, not fatal" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'X=1\n' > "$SRC/.env"          # .env.local and cfg/keys never created
+  run grove_sync_copy "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DST/.env")" = "X=1" ]
+}
+
+@test "sync_check: identical copies pass" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_check: a differing copy fails and diffs the change" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *".env differs"* ]]
+  [[ "$output" == *"-A=1"* ]]
+  [[ "$output" == *"+A=2"* ]]
+  [[ "$output" != *"diff --git"* ]]     # git's file headers are stripped
+}
+
+@test "sync_check: quiet mode reports the path without the diff" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST" 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *".env differs"* ]]
+  [[ "$output" != *"+A=2"* ]]
+}
+
+@test "sync_check: a file only in the worktree is divergence (nothing to fall back on)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'ONLY_HERE\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"exists in the worktree but not in the main checkout"* ]]
+}
+
+@test "sync_check: a path missing from the worktree is not divergence" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"          # never copied into DST
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_check: no sync.paths configured → nothing to check" {
+  set +eu
+  source "$GROVE"
+  GROVE_CONFIG_JSON='{}'
+  run grove_sync_check "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
