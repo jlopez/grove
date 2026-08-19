@@ -47,6 +47,46 @@ All notable changes to grove are documented here. Format follows
   one (jq's `*` replaces arrays).
 
 ### Fixed
+- **The teardown guard decided divergence from whether a diff *printed*, not from
+  git's exit status** — so `grove rm` deleted the worktree in three reachable
+  cases where `git diff --no-index` reports a difference while emitting nothing:
+  a file↔directory type change (exit 1, zero bytes), an unreadable file (exit
+  128, zero bytes), and a `.gitattributes` `diff=` driver that redacts both sides
+  to identical text. Comparison now goes through one `grove_sync_differs`
+  returning same / differs / **could-not-compare**, with the last failing closed
+  and `--no-textconv` so a redacting driver can't blind the guard protecting the
+  file. `grove sync check` and `grove sync list` share that function and can no
+  longer disagree about the same file.
+- **`sync.paths` is resolved as the union across roots**, not from a single one.
+  `.grove.local.json` is gitignored, so it exists only where it was written
+  (normally the main checkout) and is absent from every fresh worktree — a
+  worktree-rooted read resolved to *no paths at all*, silently disabling the
+  guard for exactly the `grove sync add --local` workflow. `grove rm` now unions
+  the invoking worktree, the worktree being torn down, and the main checkout.
+  The guard is monotone in candidates by design: an extra one costs a `git diff`
+  and is skipped when absent; a missing one loses a secret.
+- **`grove sync add` no longer promotes personal paths into the committed file.**
+  Seeding the write from the merged list ran the layering backwards, copying
+  `.grove.local.json` and XDG entries into the shared `.grove.json`. Only
+  `--local` seeds from the effective list (where array-replace semantics require
+  it); the committed file seeds from its own.
+- **`grove sync rm` reported success for a write that didn't take effect** when a
+  higher-precedence layer still listed the path. The effective list is now
+  re-derived after every write and any unmoved path is called out.
+- **A malformed `.grove.json` was silently overwritten**, discarding `color`,
+  `icon` and `agent` keys; the write now refuses. A wrong-typed `sync` key
+  (`{"sync": "x"}`) crashed jq with a raw error instead of degrading to "nothing
+  configured".
+- Diff rendering fixes: a **directory** `sync.path` showed anonymous hunks with no
+  filenames; a **mode-only** change printed an empty body under a message that
+  was factually wrong; **binary** files leaked the absolute paths the header
+  stripping exists to hide; `awk` aborted mid-stream on bytes invalid in the
+  ambient locale (now `LC_ALL=C`); and the "diff truncated" notice counted raw
+  lines rather than printed ones, so it could claim truncation that hadn't
+  happened.
+- `grove sync check|list` reject stray arguments instead of silently discarding
+  them, and a relative symlink that lands dangling in the worktree is warned
+  about.
 - `grove go` now delivers the prompt to the agent **via a temp file** instead of
   inlining it in the typed launch command (issue #26). cmux *types* the launch
   line into the new workspace's pty, whose canonical-mode input buffer caps a

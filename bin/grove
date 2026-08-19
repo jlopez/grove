@@ -108,8 +108,10 @@ grove_config_get() {
 # grove_config_get_array <keypath> — print each element of the array at <keypath>
 # on its own line, for `mapfile -t`. Absent or non-array → nothing.
 grove_config_get_array() {
+  # `try` so a wrong-typed intermediate ({"sync": "x"}) degrades to "nothing
+  # configured" instead of dying with a raw jq error under set -e.
   printf '%s' "$GROVE_CONFIG_JSON" | jq -r --arg kp "$1" '
-    getpath($kp | split(".")) as $v
+    (try getpath($kp | split(".")) catch null) as $v
     | if ($v|type)=="array" then $v[] | tostring else empty end'
 }
 
@@ -173,6 +175,7 @@ grove_sync_path_ok() {
   case "$1" in
     ''|/*)                return 1 ;;
     ..|../*|*/..|*/../*)  return 1 ;;
+    -*)                   return 1 ;;   # would be read as an option by jq/cp/git
   esac
   return 0
 }
@@ -185,7 +188,7 @@ grove_sync_path_ok() {
 grove_sync_copy() {
   local src="$1" dst="$2" p
   local paths=() copied=() missing=() tracked=() unignored=()
-  mapfile -t paths < <(grove_config_get_array "sync.paths")
+  paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
   [ ${#paths[@]} -gt 0 ] || return 0
   for p in "${paths[@]}"; do
     if ! grove_sync_path_ok "$p"; then
@@ -204,6 +207,13 @@ grove_sync_copy() {
       || { warn "sync.paths: could not create the parent directory for '$p'"; continue; }
     if cp -Rp -- "$src/$p" "$dst/$p" 2>/dev/null; then
       copied+=("$p")
+      # cp -Rp copies a symlink *as* a symlink, which is the right call (a
+      # symlinked .env is a deliberate "share one file" setup, and materializing
+      # a second copy would defeat it). But a *relative* link resolves against a
+      # different depth here than in the main checkout, so it can land dangling.
+      [ -L "$dst/$p" ] && [ ! -e "$dst/$p" ] \
+        && warn "sync.paths: '$p' is a symlink that doesn't resolve inside the worktree"
+      : 
     else
       warn "sync.paths: could not copy '$p' from the main checkout"
     fi
@@ -215,6 +225,58 @@ grove_sync_copy() {
   return 0
 }
 
+# grove_sync_resolve_paths <root>... — set GROVE_SYNC_PATHS to the *union* of
+# sync.paths as resolved at each <root>, in first-seen order. Every consumer
+# below reads that array rather than the config directly.
+#
+# Why a union and not a choice of root. The layers don't all live in the same
+# place: `.grove.json` is committed, so it's branch-scoped and rightly read from
+# the worktree you're in — but `.grove.local.json` is *gitignored*, so it can
+# only ever exist where it was written (usually the main checkout) and simply
+# isn't present in a fresh worktree. Any single root therefore drops a layer:
+# rooting at the worktree loses every personal path, rooting at the main
+# checkout loses paths a branch just added. And the two errors are not
+# symmetric — an extra candidate costs one `git diff` and is skipped when it
+# isn't present, while a missing one means `grove rm` deletes a secret it never
+# knew to check. So the guard is monotone in candidates, deliberately.
+#
+# GROVE_CONFIG_JSON is saved and restored: callers (notably `grove go`) still
+# need their own root's agent.command/style after this runs.
+GROVE_SYNC_PATHS=()
+grove_sync_resolve_paths() {
+  local saved="$GROVE_CONFIG_JSON" root p seen
+  GROVE_SYNC_PATHS=()
+  for root in "$@"; do
+    [ -n "$root" ] && [ -d "$root" ] || continue
+    grove_config_load "$root"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      seen=0
+      for c in ${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"}; do
+        [ "$c" = "$p" ] && seen=1
+      done
+      [ "$seen" = 0 ] && GROVE_SYNC_PATHS+=("$p")
+    done < <(grove_config_get_array "sync.paths")
+  done
+  GROVE_CONFIG_JSON="$saved"
+}
+
+# grove_sync_differs <a> <b> — the single comparison both the guard and the
+# lister go through. Exit: 0 same, 1 differs, 2 could-not-compare. The status
+# comes from git, never from "did the diff print anything": a `.gitattributes`
+# textconv driver, a file↔directory type change, and an unreadable file all make
+# git report a difference while printing *nothing*, and a guard that inferred
+# "same" from empty output would let `grove rm` delete the only copy of a secret.
+# --no-textconv for the same reason — a redacting diff driver must not be able to
+# make two different .env files look identical to the guard protecting them.
+grove_sync_differs() {
+  local rc=0
+  git --no-pager diff --no-index --no-ext-diff --no-textconv --quiet \
+    -- "$1" "$2" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -le 1 ] && return "$rc"
+  return 2                              # git errored — fail closed, never "same"
+}
+
 # grove_sync_check <src-root> <dst-root> [quiet] — compare every configured
 # sync.path in <dst-root> against <src-root>. Returns 1 if any diverged, 0
 # otherwise (including "nothing configured"). Divergence is reported on stderr
@@ -223,9 +285,9 @@ grove_sync_copy() {
 # summary only (the --force path, where the diff would just be noise).
 # Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
 grove_sync_check() {
-  local src="$1" dst="$2" quiet="${3:-}" p d diverged=0
+  local src="$1" dst="$2" quiet="${3:-}" p d body rc diverged=0
   local paths=() color=never max=40
-  mapfile -t paths < <(grove_config_get_array "sync.paths")
+  paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
   [ ${#paths[@]} -gt 0 ] || return 0
   [ -t 2 ] && color=always
   for p in "${paths[@]}"; do
@@ -236,29 +298,78 @@ grove_sync_check() {
       warn "sync: ${_c_bld}$p${_c_rst} exists in the worktree but not in the main checkout"
       continue
     fi
-    # --no-index diffs plain paths (both are gitignored, so the index knows
-    # nothing about them); it exits 1 on difference, hence the `|| true`.
-    d=$(git --no-pager diff --no-index --no-ext-diff "--color=$color" \
-          -- "$src/$p" "$dst/$p" 2>/dev/null) || true
-    [ -n "$d" ] || continue
+    grove_sync_differs "$src/$p" "$dst/$p" && continue
+    rc=$?
     diverged=1
+    if [ "$rc" = 2 ]; then
+      # Fail closed and say why: the point of the guard is that "I couldn't tell"
+      # must never be reported as "they match".
+      warn "sync: ${_c_bld}$p${_c_rst} could not be compared with the main checkout — refusing to assume it matches"
+      continue
+    fi
     if [ -n "$quiet" ]; then
       warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout"
       continue
     fi
     warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout (- main, + worktree):"
-    # Drop git's file headers — the absolute paths are long and the line above
-    # already names the file. The match is made on a color-stripped copy of each
-    # line so the printed line keeps its ANSI attributes.
-    printf '%s\n' "$d" \
-      | awk -v e=$'\033' '{ l=$0; gsub(e "\\[[0-9;]*m", "", l)
-          if (l ~ /^(diff --git |index |--- |\+\+\+ |old mode |new mode )/) next
-          print }' \
-      | head -n "$max" >&2
-    [ "$(printf '%s\n' "$d" | wc -l)" -gt "$max" ] \
+    # A *display* diff — divergence was already decided above, so this one is
+    # allowed to come back empty (a type change prints nothing).
+    d=$(git --no-pager diff --no-index --no-ext-diff --no-textconv "--color=$color" \
+          -- "$src/$p" "$dst/$p" 2>/dev/null) || true
+    body=$(grove_sync_diff_body "$d" "$src/$p" "$dst/$p")
+    if [ -z "$body" ]; then
+      printf '    %s(no textual diff — the two are not the same kind of file)%s\n' \
+        "$_c_dim" "$_c_rst" >&2
+      continue
+    fi
+    { printf '%s\n' "$body" | head -n "$max" || true; } >&2
+    [ "$(printf '%s\n' "$body" | wc -l)" -gt "$max" ] \
       && printf '    %s… diff truncated%s\n' "$_c_dim" "$_c_rst" >&2
   done
   return $diverged
+}
+
+# grove_sync_diff_body <diff> <src-path> <dst-path> — strip git's file headers
+# from a `--no-index` diff for display. For a single file the `warn` line above
+# already names it, so the headers are pure noise (they carry absolute paths).
+# For a *directory* sync.path the diff spans many files, and dropping the headers
+# would leave anonymous hunks nobody can act on — so there the `+++` line is
+# rewritten to a short path relative to the synced root. Matching is done on a
+# color-stripped copy of each line, so printed lines keep their ANSI attributes.
+grove_sync_diff_body() {
+  local d="$1" srcp="$2" dstp="$3" multi=0
+  [ -d "$srcp" ] || [ -d "$dstp" ] && multi=1
+  # LC_ALL=C: a diff of a file git judged textual can still carry bytes that
+  # aren't valid in the ambient locale, and awk aborts mid-stream on those
+  # ("multibyte conversion failure"), mangling the very output the guard exists
+  # to show. Byte semantics keep it a pass-through.
+  printf '%s\n' "$d" | LC_ALL=C awk -v e=$'\033' -v multi="$multi" \
+      -v sp="$srcp/" -v dp="$dstp/" '
+    function plain(s) { gsub(e "\\[[0-9;]*m", "", s); return s }
+    {
+      l = plain($0)
+      if (l ~ /^Binary files /) {
+        name = l; sub(/^Binary files .* and b/, "", name); sub(/ differ$/, "", name)
+        idx = index(name, dp); if (idx) name = substr(name, idx + length(dp))
+        print (multi && name != "" ? "  " name ": binary files differ" : "  binary files differ")
+        next
+      }
+      if (l ~ /^(old mode |new mode )/) {
+        # A mode-only change produces a diff with no hunks at all; filtering
+        # these out left an empty body and a message claiming the files were of
+        # different kinds. Report the mode change as the content it is.
+        m = l; sub(/^(old|new) mode /, "", m)
+        if (l ~ /^old mode /) { oldm = m } else { print "  mode changed " oldm " -> " m }
+        next
+      }
+      if (multi && l ~ /^\+\+\+ /) {
+        name = l; sub(/^\+\+\+ b/, "", name)
+        idx = index(name, dp); if (idx) name = substr(name, idx + length(dp))
+        if (name != "" && name != "/dev/null") { print "  " name ":" ; next }
+      }
+      if (l ~ /^(diff --git |index |--- |\+\+\+ |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )/) next
+      print
+    }'
 }
 
 # grove_sync_list <main> [dst] — print one status row per configured sync.path.
@@ -268,9 +379,9 @@ grove_sync_check() {
 # a config error, so it doesn't set the flag. Shared by `grove sync list` and
 # `grove doctor`; reads GROVE_CONFIG_JSON.
 grove_sync_list() {
-  local main="$1" dst="${2:-}" p bad=0
+  local main="$1" dst="${2:-}" p rc bad=0
   local paths=()
-  mapfile -t paths < <(grove_config_get_array "sync.paths")
+  paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
   [ ${#paths[@]} -gt 0 ] || return 0
   [ "$dst" = "$main" ] && dst=""
   for p in "${paths[@]}"; do
@@ -291,9 +402,13 @@ grove_sync_list() {
     elif [ ! -e "$dst/$p" ]; then
       printf '  %s!%s %s %s(not in this worktree — run '"'"'grove sync'"'"')%s\n' \
         "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
-    elif git --no-pager diff --no-index --no-ext-diff --quiet \
-           -- "$main/$p" "$dst/$p" >/dev/null 2>&1; then
+    elif rc=0; grove_sync_differs "$main/$p" "$dst/$p" || rc=$?; [ "$rc" = 0 ]; then
       printf '  %s✓%s %s %s(in sync)%s\n' "$_c_grn" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
+    elif [ "$rc" = 2 ]; then
+      # Same distinction grove_sync_check makes: "I couldn't tell" is not
+      # "they differ", and the two commands must not contradict each other.
+      printf '  %s!%s %s %s(could not be compared with the main checkout)%s\n' \
+        "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
     else
       printf '  %s!%s %s %s(differs from the main checkout — '"'"'grove sync check'"'"')%s\n' \
         "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
@@ -313,8 +428,26 @@ grove_sync_write() {
   local root="$1" local_layer="$2" op="$3"; shift 3
   local f="$root/.grove.json" base='{}' cur=() out p
   [ -n "$local_layer" ] && f="$root/.grove.local.json"
-  mapfile -t cur < <(grove_config_get_array "sync.paths")
-  [ -f "$f" ] && jq -e . "$f" >/dev/null 2>&1 && base=$(cat "$f")
+  # Refuse to touch a file we couldn't parse: `base` would silently stay {} and
+  # the write would discard every other key in it (color, icon, agent…).
+  # grove_config_load only *skips* a bad layer; overwriting it is another matter.
+  if [ -f "$f" ]; then
+    jq -e . "$f" >/dev/null 2>&1 \
+      || die "$f is not valid JSON — fix it by hand rather than have grove overwrite it"
+    base=$(cat "$f")
+  fi
+  # The base list: for --local, the *effective* one, because jq's `*` replaces
+  # arrays — a local layer holding only the new path would silently supersede the
+  # committed list. For the committed file the same move would run the layering
+  # backwards, promoting personal (.grove.local.json) and machine-wide (XDG)
+  # paths into the file everyone shares, so it seeds from the file's own list.
+  if [ -n "$local_layer" ]; then
+    mapfile -t cur < <(grove_config_get_array "sync.paths")
+  else
+    mapfile -t cur < <(printf '%s' "$base" | jq -r '
+      (.sync? // {} | if type == "object" then .paths else null end) as $v
+      | if ($v | type) == "array" then $v[] | tostring else empty end')
+  fi
   # Compose the next list in bash so order is preserved — appended at the end,
   # the way a human editing the file would do it.
   local next=()
@@ -341,10 +474,30 @@ grove_sync_write() {
   out=$(printf '%s' "$base" | jq --args \
         'if ($ARGS.positional | length) == 0 then (del(.sync.paths) | if (.sync // {}) == {} then del(.sync) else . end)
          else .sync.paths = $ARGS.positional end' \
-        ${next[@]+"${next[@]}"}) || die "failed to update $f"
+        -- ${next[@]+"${next[@]}"}) || die "failed to update $f"
   printf '%s\n' "$out" > "$f"
   info "wrote $f"
   grove_config_load "$root"
+
+  # Writing a lower-precedence layer can be a no-op: a higher one replaces the
+  # whole array. Re-derive the effective list and say so, rather than reporting
+  # "wrote …" for a change that didn't take (an `rm` that silently leaves the
+  # path synced is the dangerous direction).
+  local eff=() c still=() have
+  mapfile -t eff < <(grove_config_get_array "sync.paths")
+  for p in "$@"; do
+    have=0
+    for c in ${eff[@]+"${eff[@]}"}; do [ "$c" = "$p" ] && have=1; done
+    case "$op" in
+      rm)  [ "$have" = 1 ] && still+=("$p") ;;
+      add) [ "$have" = 0 ] && still+=("$p") ;;
+    esac
+  done
+  if [ ${#still[@]} -gt 0 ]; then
+    warn "no effect on the resolved config: ${still[*]}"
+    warn "(a higher-precedence layer replaces sync.paths — .grove.local.json wins"
+    warn " over .grove.json; see 'grove help' for the layer order)"
+  fi
 }
 
 # ---- group styling ----------------------------------------------------------
@@ -792,6 +945,7 @@ grove_go() {
   #    so the agent's very first command already sees them. Existing files are
   #    never overwritten, so a reused worktree (G2) keeps its own.
   grove_config_load "$WORKTREE_ROOT"
+  grove_sync_resolve_paths "$WORKTREE_ROOT" "$canon_repo"
   grove_sync_copy "$canon_repo" "$wtpath"
 
   # 5. Build the command cmux types into the new workspace's shell, from the
@@ -927,7 +1081,13 @@ grove_rm() {
   #    finding, it just downgrades it to a one-line warning: the removal is
   #    still discarding content that exists nowhere else.
   if [ -n "$wtpath" ]; then
+    # Candidates come from every root that could name one: the worktree grove
+    # was invoked from, the worktree being torn down (a branch may have added a
+    # path that isn't merged yet), and the main checkout (the only place the
+    # gitignored .grove.local.json can live). Union, never a choice — see
+    # grove_sync_resolve_paths for why the guard is monotone.
     grove_config_load "$WORKTREE_ROOT"
+    grove_sync_resolve_paths "$WORKTREE_ROOT" "$wtpath" "$canon_repo"
     if ! grove_sync_check "$canon_repo" "$wtpath" "$opt_force"; then
       [ -n "$opt_force" ] \
         || die "synced paths differ from the main checkout (above) — copy what you need, then re-run 'grove rm --force'"
@@ -1082,6 +1242,16 @@ grove_sync() {
     *)  die "grove sync: unknown subcommand '$sub' (list, check, add, rm)" ;;
   esac
 
+  # Reject stray args on the argument-less subcommands before anything else, so
+  # a typo can't be masked by an earlier "nothing configured" return. `go`/`rm`/
+  # `restyle` all die on unknown arguments too.
+  case "$sub" in
+    copy|check|list)
+      [ $# -eq 0 ] \
+        || die "grove sync${sub:+ ${sub/copy/}}: unexpected argument '$1' (paths go to 'add'/'rm')"
+      ;;
+  esac
+
   command -v jq >/dev/null 2>&1 || die "jq not found — see 'grove doctor'"
   grove_repo_identity
   grove_config_load "$WORKTREE_ROOT"
@@ -1089,10 +1259,12 @@ grove_sync() {
   local canon_wt canon_repo
   canon_wt=$(cd "$WORKTREE_ROOT" 2>/dev/null && pwd -P) || canon_wt="$WORKTREE_ROOT"
   canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P)   || canon_repo="$REPO_PATH"
+  # Same union every other consumer sees, so `grove sync` can't report on a
+  # different set of paths than `grove go`/`grove rm` act on.
+  grove_sync_resolve_paths "$WORKTREE_ROOT" "$canon_repo"
 
-  local n
-  n=$(printf '%s' "$GROVE_CONFIG_JSON" | jq '(.sync.paths // []) | length')
-  if [ "$n" = 0 ] && [ "$sub" != add ]; then
+  local n=${#GROVE_SYNC_PATHS[@]}
+  if [ "$n" = 0 ] && [ "$sub" != add ] && [ "$sub" != rm ]; then
     warn "no sync.paths configured — add one with 'grove sync add <path>'"
     return 0
   fi
@@ -1148,6 +1320,7 @@ grove_sync() {
         done
       fi
       grove_sync_write "$WORKTREE_ROOT" "$local_layer" "$sub" "${args[@]}"
+      grove_sync_resolve_paths "$WORKTREE_ROOT" "$canon_repo"
       printf '%ssync.paths%s %s(from %s)%s\n' \
         "$_c_bld" "$_c_rst" "$_c_dim" "$canon_repo" "$_c_rst"
       grove_sync_list "$canon_repo" "$canon_wt" || true ;;
@@ -1192,12 +1365,13 @@ grove_doctor() {
   # misconfigured path fails the doctor; mere divergence doesn't, that's what
   # `grove sync check` is for).
   local sync_n=0 main="" wtroot=""
-  sync_n=$(printf '%s' "$GROVE_CONFIG_JSON" | jq '(.sync.paths // []) | length')
+  main=$(git rev-parse --git-common-dir 2>/dev/null) \
+    && main=$(dirname "$(cd "$main" && pwd -P)")
+  wtroot=$(git rev-parse --show-toplevel 2>/dev/null) \
+    && wtroot=$(cd "$wtroot" && pwd -P)
+  [ -n "$wtroot" ] && grove_sync_resolve_paths "$wtroot" "$main"
+  sync_n=${#GROVE_SYNC_PATHS[@]}
   if [ "$sync_n" != 0 ]; then
-    main=$(git rev-parse --git-common-dir 2>/dev/null) \
-      && main=$(dirname "$(cd "$main" && pwd -P)")
-    wtroot=$(git rev-parse --show-toplevel 2>/dev/null) \
-      && wtroot=$(cd "$wtroot" && pwd -P)
     printf '\n%sSynced paths%s %s(from %s)%s\n' \
       "$_c_bld" "$_c_rst" "$_c_dim" "${main:-?}" "$_c_rst"
     grove_sync_list "$main" "$wtroot" || ok=1

@@ -425,10 +425,35 @@ Three rules, each a deliberate failure-mode choice:
   convenience quietly becomes a teardown blocker. `git check-ignore -q` is the real gate;
   `git ls-files -- <path>` runs first only to diagnose the tracked case separately (it also
   answers correctly for directories, listing any tracked file underneath).
+- **Symlinks are copied as symlinks, not dereferenced.** `cp -Rp` preserves the link, which is
+  the right call: a symlinked `.env` is a deliberate "one shared file" setup, and materializing
+  a second copy would defeat it *and* start blocking `grove rm` once the copy diverged. The
+  guard reporting "in sync" is likewise correct — the content lives outside the worktree, so
+  removal destroys a link, not data. The one real failure is a *relative* link, which resolves
+  against a different depth in the worktree and can land dangling; that's warned about after the
+  copy.
 - **Nothing here is fatal.** An absent source (a fresh clone has no `.env`), an unsafe entry
   (absolute or `..`-escaping), a failed `cp` — each warns and continues. A half-synced worktree
   still beats no worktree; the agent's error message about the missing file is clearer than
   grove refusing to spawn.
+
+### Which roots the path list comes from
+
+The layers don't all live in the same place, so no single root resolves them all.
+`.grove.json` is committed — branch-scoped, rightly read from the worktree you're in.
+`.grove.local.json` is **gitignored**, so it can only exist where it was written (normally
+the main checkout) and is simply *absent* from a fresh worktree. Rooting at the worktree
+drops every personal path; rooting at the main checkout drops paths a branch just added.
+
+So `grove_sync_resolve_paths` takes the **union** across roots — the invoking worktree, the
+worktree being torn down (for `rm`), and the main checkout — rather than choosing one. The
+two errors aren't symmetric: an extra candidate costs one `git diff` and is skipped when it
+isn't present in the destination, while a missing one means `grove rm` deletes a secret it
+never knew to check. **The guard is monotone in candidates, deliberately.**
+
+This is not hypothetical: `grove sync add --local .env` writes a gitignored file that exists
+only in the main checkout, so any worktree-rooted read would resolve to *nothing* and
+silently disable the guard for precisely the workflow the command exists to support.
 
 ### Guard side (`grove_sync_check`)
 
@@ -451,11 +476,29 @@ grove: sync: .env differs from the main checkout (- main, + worktree):
 +EXTRA=yes
 ```
 
-`--no-index` is required (both sides are gitignored, so the index knows nothing about them)
-and exits 1 on difference, hence the `|| true`. git's file headers (`diff --git`, `index`,
-`---`/`+++`) are stripped — they carry absolute paths and the line above already names the
-file — by matching each line against a **color-stripped copy** of itself in `awk`, so the
-printed line keeps its ANSI attributes. Output is capped at 40 lines per path.
+**Divergence is decided by git's exit status, never by whether a diff printed.** This is the
+single most important line in the feature. `git diff --no-index` reports a difference while
+printing *nothing* in at least three reachable cases: a file↔directory type change (exit 1,
+zero bytes), an unreadable file (exit 128, zero bytes), and a `.gitattributes` `diff=` driver
+that redacts both sides to identical text. A guard that inferred "same" from empty output
+would hand each of those to `wt remove`. `grove_sync_differs` returns 0/1/2 (same / differs /
+**could not compare**), and 2 fails closed with its own message — "I couldn't tell" must never
+render as "they match". `--no-textconv` for the same reason: a redacting diff driver must not
+be able to blind the guard protecting the file. `grove_sync_check` and `grove_sync_list` share
+that one function, so the two commands cannot disagree about the same file.
+
+The rendering is separate from the verdict, and only runs once divergence is already decided.
+git's file headers are stripped — they carry absolute paths and the line above already names
+the file — by matching each line against a **color-stripped copy** of itself in `awk`, so the
+printed line keeps its ANSI attributes. Three cases get special handling: a **directory**
+`sync.path` spans many files, so there the `+++` line is rewritten to a short relative label
+instead of dropped (anonymous hunks are useless to act on); a **mode-only** change produces a
+diff with no hunks at all, so `old mode`/`new mode` become `mode changed 100644 -> 100755`
+rather than an empty body; and **binary** files collapse to `binary files differ` instead of
+leaking the absolute paths the stripping exists to hide. `awk` runs under `LC_ALL=C`, because
+a file git judged textual can still carry bytes that abort a locale-aware `awk` mid-stream.
+Output is capped at 40 lines per path, counted **after** stripping so the "truncated" notice
+is honest.
 
 A path present in the worktree but **absent from the main checkout** is divergence too: there
 is nothing to fall back on, so it's the case with the most to lose. The inverse (present in
@@ -498,6 +541,18 @@ Two things they do that hand-editing wouldn't:
   already carries it. Not-gitignored, or not-yet-existing, only *warn* and still write: you may
   be about to add the `.gitignore` line or create the file. Silently accepting either would
   just defer the confusion to the next `grove go`.
+- **The write direction matters.** `--local` seeds from the *effective* (merged) list, because
+  jq's `*` replaces arrays and a local layer holding only the new path would silently supersede
+  the committed one. The committed file seeds from **its own** list instead — seeding it from
+  the merged one would run the layering backwards, promoting personal (`.grove.local.json`) and
+  machine-wide (XDG) paths into the file everyone shares.
+- **A write that can't take effect says so.** Writing a lower-precedence layer is a no-op when a
+  higher one replaces the whole array; after the write, the effective list is re-derived and any
+  path that didn't move is reported. An `rm` that silently leaves a path synced is the dangerous
+  direction.
+- **A malformed target file is never overwritten.** `grove_config_load` only *skips* an
+  unparseable layer; writing one would discard every other key in it (`color`, `icon`, `agent`).
+  The write refuses instead.
 - **`--local` carries the effective list forward.** jq's `*` **replaces** arrays (see
   [Merge](#merge--nearly-free)), so a `.grove.local.json` holding only the newly added path
   would silently supersede the committed list. Writing the merged result is the only shape

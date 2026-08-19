@@ -916,7 +916,7 @@ _sync_fixture() {
   git -C "$SRC" add .gitignore
   git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm init
   printf '%s\n' '{ "sync": { "paths": [".env", ".env.local", "cfg/keys"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
 }
 
 @test "sync_path_ok: rejects absolute paths and .. escapes" {
@@ -956,7 +956,7 @@ _sync_fixture() {
   source "$GROVE"
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": ["loose.txt"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   printf 'LOOSE\n' > "$SRC/loose.txt"        # untracked, but not ignored either
   run grove_sync_copy "$SRC" "$DST"
   [ "$status" -eq 0 ]
@@ -1065,7 +1065,7 @@ _sync_fixture() {
   source "$GROVE"
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": [".env", "loose.txt", ".gitignore", "gone"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
   printf 'L\n'   > "$SRC/loose.txt"                    # untracked but not ignored
   run grove_sync_list "$SRC" "$DST"
@@ -1082,7 +1082,7 @@ _sync_fixture() {
   _sync_fixture
   printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"
   printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   run grove_sync_list "$SRC" "$DST"
   [ "$status" -eq 0 ]
   [[ "$output" == *"in sync"* ]]
@@ -1096,7 +1096,7 @@ _sync_fixture() {
   source "$GROVE"
   _sync_fixture
   printf '%s\n' '{ "color": "#123456", "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   grove_sync_write "$SRC" "" add ".env.local" ".env"
   [ "$(jq -r '.color' "$SRC/.grove.json")" = "#123456" ]
   [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env",".env.local"]' ]
@@ -1107,7 +1107,7 @@ _sync_fixture() {
   source "$GROVE"
   _sync_fixture
   printf '%s\n' '{ "color": "#123456", "sync": { "paths": [".env", ".env.local"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   grove_sync_write "$SRC" "" rm ".env.local"
   [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env"]' ]
   grove_sync_write "$SRC" "" rm ".env"
@@ -1120,10 +1120,229 @@ _sync_fixture() {
   source "$GROVE"
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": [".env", ".env.local"] } }' > "$SRC/.grove.json"
-  grove_config_load "$SRC"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
   grove_sync_write "$SRC" 1 add "mine.txt"
   # The local layer must restate the committed paths — jq's `*` replaces arrays,
   # so a one-element local list would silently supersede the shared one.
   [ "$(jq -c '.sync.paths' "$SRC/.grove.local.json")" = '[".env",".env.local","mine.txt"]' ]
   [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env",".env.local"]' ]
+}
+
+# ---- the review's failure modes (regression tests) --------------------------
+
+@test "sync_differs: status comes from git, not from whether a diff printed" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  local d; d="$BATS_TEST_TMPDIR/differs"; mkdir -p "$d/a" "$d/b"
+  printf 'A=1\n' > "$d/a/.env"; printf 'A=1\n' > "$d/b/.env"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  [ "$status" -eq 0 ]                          # identical
+  printf 'A=2\n' > "$d/b/.env"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  [ "$status" -eq 1 ]                          # plain difference
+  # A type change: git reports a difference but prints NOTHING. Deciding from
+  # output emptiness would call this "in sync" and let grove rm delete it.
+  rm -f "$d/b/.env"; mkdir "$d/b/.env"; printf 's\n' > "$d/b/.env/inner"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  [ "$status" -eq 1 ]
+}
+
+@test "sync_differs: an unreadable file is 'could not compare', never 'same'" {
+  [ "$(id -u)" != 0 ] || skip "root reads everything"
+  set +eu
+  source "$GROVE"
+  set +eu
+  local d; d="$BATS_TEST_TMPDIR/unreadable"; mkdir -p "$d/a" "$d/b"
+  printf 'A=1\n' > "$d/a/.env"; printf 'A=2\n' > "$d/b/.env"; chmod 000 "$d/b/.env"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  chmod 644 "$d/b/.env"
+  [ "$status" -eq 2 ]
+}
+
+@test "sync_check: a textconv diff driver cannot make two files look identical" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  # A redacting driver collapses both sides to the same text — the guard must
+  # still see a difference, because it asks git for a verdict, not for output.
+  printf '.env diff=redact\n' > "$SRC/.gitattributes"
+  git -C "$SRC" config diff.redact.textconv 'echo REDACTED'
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+}
+
+@test "sync_check and sync_list agree on divergence (they share one comparison)" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  printf 'A=1\n' > "$SRC/.env"
+  local variant
+  for variant in same differ type; do
+    rm -rf "$DST/.env"
+    case "$variant" in
+      same)   printf 'A=1\n' > "$DST/.env" ;;
+      differ) printf 'A=2\n' > "$DST/.env" ;;
+      type)   mkdir "$DST/.env"; printf 's\n' > "$DST/.env/inner" ;;
+    esac
+    run grove_sync_check "$SRC" "$DST" 1
+    local check_said="$status"
+    run grove_sync_list "$SRC" "$DST"
+    if [ "$variant" = same ]; then
+      [ "$check_said" -eq 0 ]; [[ "$output" == *"in sync"* ]]
+    else
+      [ "$check_said" -eq 1 ]; [[ "$output" == *"differs"* ]]
+    fi
+  done
+}
+
+@test "sync_check: a directory path names each differing file in the diff" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": ["cfg"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  mkdir -p "$SRC/cfg" "$DST/cfg"
+  printf 'a=1\n' > "$SRC/cfg/a"; printf 'a=2\n' > "$DST/cfg/a"
+  printf 'c=1\n' > "$DST/cfg/c"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"a:"* ]]                   # per-file labels, not anonymous hunks
+  [[ "$output" == *"c:"* ]]
+  [[ "$output" != *"$SRC"* ]]                 # and no absolute paths leaked
+}
+
+@test "sync_write: add without --local does not promote local-layer paths" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf '%s\n' '{ "color": "#112233", "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  printf '%s\n' '{ "sync": { "paths": [".env", "personal.key"] } }' > "$SRC/.grove.local.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  grove_sync_write "$SRC" "" add ".env.test"
+  # personal.key is deliberately personal — writing the committed file must not
+  # carry it upward into the layer everyone shares.
+  [ "$(jq -c '.sync.paths' "$SRC/.grove.json")" = '[".env",".env.test"]' ]
+  [ "$(jq -r '.color' "$SRC/.grove.json")" = "#112233" ]
+}
+
+@test "sync_write: warns when a higher layer shadows the write (rm is a no-op)" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.local.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  run grove_sync_write "$SRC" "" rm ".env"
+  [[ "$output" == *"no effect on the resolved config"* ]]
+}
+
+@test "sync_write: refuses to overwrite a malformed target file" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf '%s\n' '{ "color": "#112233",}' > "$SRC/.grove.json"   # trailing comma
+  run grove_sync_write "$SRC" "" add ".env"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not valid JSON"* ]]
+  [[ "$(cat "$SRC/.grove.json")" == *'"#112233"'* ]]            # left intact
+}
+
+@test "config_get_array: a wrong-typed key degrades to empty, no jq crash" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  GROVE_CONFIG_JSON='{"sync":"oops"}'
+  run grove_config_get_array "sync.paths"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "sync_path_ok: rejects a leading dash (it would parse as an option)" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  ! grove_sync_path_ok "-rf"
+  ! grove_sync_path_ok "--local"
+}
+
+@test "sync: check/list reject stray arguments instead of ignoring them" {
+  run "$GROVE" sync list stray
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected argument"* ]]
+}
+
+@test "sync_resolve_paths: unions every root, dedupes, preserves GROVE_CONFIG_JSON" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  local d; d="$BATS_TEST_TMPDIR/union"; mkdir -p "$d/main" "$d/wt"
+  printf '%s\n' '{ "color": "#111111", "sync": { "paths": [".env", "shared"] } }' > "$d/main/.grove.json"
+  printf '%s\n' '{ "sync": { "paths": ["personal"] } }' > "$d/main/.grove.local.json"
+  printf '%s\n' '{ "sync": { "paths": ["shared", "branch-only"] } }' > "$d/wt/.grove.json"
+  grove_config_load "$d/wt"
+  local before="$GROVE_CONFIG_JSON"
+  grove_sync_resolve_paths "$d/wt" "$d/main"
+  [ "${GROVE_SYNC_PATHS[*]}" = "shared branch-only .env personal" ]
+  [ "$GROVE_CONFIG_JSON" = "$before" ]     # callers still need their own root's config
+}
+
+@test "sync_resolve_paths: the gitignored personal layer survives a worktree root" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  # .grove.local.json is gitignored, so it can only ever exist in the main
+  # checkout — a worktree-only root would silently resolve to no paths at all,
+  # disabling the teardown guard for exactly the 'sync add --local' workflow.
+  local d; d="$BATS_TEST_TMPDIR/localonly"; mkdir -p "$d/main" "$d/wt"
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$d/main/.grove.local.json"
+  grove_sync_resolve_paths "$d/wt"
+  [ "${#GROVE_SYNC_PATHS[@]}" -eq 0 ]      # worktree alone sees nothing…
+  grove_sync_resolve_paths "$d/wt" "$d/main"
+  [ "${GROVE_SYNC_PATHS[*]}" = ".env" ]    # …the union still finds it
+}
+
+@test "sync_check: a mode-only change is reported as a mode change" {
+  set +eu
+  source "$GROVE"
+  set +eu
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"; chmod +x "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  chmod 644 "$DST/.env"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mode changed"* ]]
+  [[ "$output" != *"not the same kind of file"* ]]   # the old, factually wrong message
+}
+
+@test "sync_check runs correctly under the script's own set -euo pipefail" {
+  # Sourcing into a CHILD shell keeps errexit/nounset/pipefail active, which
+  # sourcing into the test's own shell cannot (bats needs them off).
+  local d; d="$BATS_TEST_TMPDIR/strict"; mkdir -p "$d/main" "$d/wt"
+  git -C "$d/main" init -q -b main
+  printf '.env\n' > "$d/main/.gitignore"
+  git -C "$d/main" add .gitignore
+  git -C "$d/main" -c user.email=t@t -c user.name=t commit -qm init
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$d/main/.grove.json"
+  seq 1 100 > "$d/main/.env"; seq 101 200 > "$d/wt/.env"     # >40 lines: truncation path
+  GROVE="$GROVE" MAIN="$d/main" WT="$d/wt" run bash -c '
+    source "$GROVE"
+    set -o | grep -qE "^errexit[[:space:]]+on" || { echo "errexit off"; exit 9; }
+    grove_sync_resolve_paths "$MAIN"
+    rc=0; grove_sync_check "$MAIN" "$WT" || rc=$?
+    echo "RC=$rc"'
+  [[ "$output" == *"RC=1"* ]]
+  [[ "$output" == *"diff truncated"* ]]
+  [[ "$output" != *"errexit off"* ]]
 }
