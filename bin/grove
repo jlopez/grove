@@ -247,7 +247,7 @@ grove_sync_resolve_paths() {
   local saved="$GROVE_CONFIG_JSON" root p seen
   GROVE_SYNC_PATHS=()
   for root in "$@"; do
-    [ -n "$root" ] && [ -d "$root" ] || continue
+    [ -d "${root:-}" ] || continue
     grove_config_load "$root"
     while IFS= read -r p; do
       [ -n "$p" ] || continue
