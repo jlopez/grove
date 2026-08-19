@@ -1181,8 +1181,10 @@ ${_c_bld}Per-repo agent${_c_rst} (any of the layers above):
 ${_c_bld}Synced untracked paths${_c_rst} (any of the layers above):
   sync.paths     array of repo-relative gitignored files/dirs (e.g. [".env"])
                  copied from the main checkout into each new worktree. An
-                 existing file is never overwritten, and a git-tracked path is
-                 refused. Before removing a worktree, 'grove rm' diffs each one
+                 existing file is never overwritten, and only gitignored paths
+                 sync (anything git tracks or would report as untracked would
+                 leave the worktree dirty and block 'wt remove'). 'grove doctor'
+                 lists them. Before removing a worktree, 'grove rm' diffs each one
                  against the main checkout and refuses if any differs — so a
                  secret written only in the worktree is never deleted unseen;
                  --force removes anyway.
