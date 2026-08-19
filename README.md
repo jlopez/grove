@@ -47,6 +47,7 @@ grove go <branch> [prompt...]        Create a worktree + spawn a cmux Claude age
 grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
                                      Done with a feature: remove the worktree +
                                      close its cmux tab (defaults to current branch)
+grove sync [list|check|add|rm]       Manage the untracked paths carried into worktrees
 grove init [--with-multi-account]    Optional wiring (wt alias, cmux plugin, direnv)
 grove doctor                         Check dependencies and wiring
 grove version
@@ -72,6 +73,59 @@ personal). Files deep-merge, last layer wins per key. This drives the per-repo g
 **agent** grove launches (`{ "agent": { "command"?, "args"? } }` — `command` defaults to
 `claude`, `args` is an array of argv tokens passed before the prompt). `grove init`
 gitignores `.grove.local.json`.
+
+### Synced untracked paths (`.env` & friends)
+
+Some files every worktree needs are exactly the ones git never carries. List them and
+grove copies them from the main checkout into each new worktree:
+
+```json
+{ "sync": { "paths": [".env", ".env.local", ".claude/settings.local.json"] } }
+```
+
+An allow-list, not `wt step copy-ignored`'s deny-list — nothing drags `node_modules/` along.
+An existing file in the worktree is **never overwritten** (yours wins), and only **gitignored**
+paths are synced — a tracked path is already carried by git, and copying an untracked-but-not-
+ignored file would leave the worktree dirty and make `wt remove` refuse.
+
+The other half is teardown. `.env` lives only on disk, so git can't preserve it and wt's
+dirty-tree check can't even see it — deleting the worktree would take an edited secret with
+it, silently. So `grove rm` diffs each synced path against the main checkout first and
+**refuses if any differs**, printing a colored diff:
+
+```
+grove: sync: .env differs from the main checkout (- main, + worktree):
+@@ -1,3 +1,4 @@
+ API_KEY=abc
+-PORT=3000
++PORT=3001
++EXTRA=yes
+grove: synced paths differ from the main checkout (above) — copy what you need,
+       then re-run 'grove rm --force'
+```
+
+`grove sync` is the same machinery as a verb, for when the config changes after the
+agents are already running:
+
+```sh
+grove sync                    # copy any missing paths into this worktree
+grove sync check              # diff against the main checkout (exit 1 if any differ)
+grove sync list               # each path's config + worktree state
+grove sync add [--local] .env # edit .grove.json, so hand-editing the array is optional
+grove sync rm  [--local] .env
+```
+
+Bare `grove sync` covers the case `grove go` can't: you add `.env` to the main checkout
+*after* spawning five agents, and the attach gate rightly refuses to re-run `grove go` for
+any of them. `check` exits 1 on divergence, so it composes into scripts and hooks. `add`
+refuses a tracked path outright and warns (but still writes) on one that isn't gitignored
+or doesn't exist yet.
+
+Look at it, decide you don't care, `grove rm -f`. The check is stateless — it compares
+against the main checkout rather than a hash taken at copy time — so a rotated `.env` in
+main shows up as divergence too, which is what you want to see before deleting. `grove
+doctor` lists the configured paths and flags any that are absent from the main checkout,
+already tracked, or not gitignored.
 
 ### Multi-account `gh` in worktrees
 

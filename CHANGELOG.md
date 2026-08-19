@@ -6,7 +6,87 @@ All notable changes to grove are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- **`sync.paths` — untracked files carried into worktrees, and guarded on the way
+  out.** A new config key (any layer) names repo-relative gitignored paths —
+  `{ "sync": { "paths": [".env", ".env.local"] } }` — that every worktree needs but
+  git never carries. `grove go` copies them from the main checkout into the new
+  worktree before the workspace is created, so the agent's first command already
+  sees them. An existing file in the worktree is **never overwritten** (a reused
+  worktree keeps its own), and only **gitignored** paths are synced — a tracked path
+  is already carried by git, and copying an untracked-but-not-ignored one would
+  leave the worktree dirty and make `wt remove` refuse. Absent sources and unsafe
+  entries warn and are skipped, never fatal.
+
+  The other half is teardown: `.env` lives only on disk, so git can't preserve it
+  and `wt remove`'s dirty-tree refusal is structurally blind to it (it's
+  gitignored, therefore never "dirty"). So `grove rm` now diffs each synced path
+  against the main checkout **before** removing anything and refuses if any
+  differs, printing a **colored `git diff`** per path — enough to judge "I don't
+  care about that line" and re-run with `--force`, which removes anyway but keeps
+  a one-line warning per diverged path. The check is deliberately stateless: it
+  compares against the main checkout rather than a hash recorded at copy time, so
+  there's no state file to manage and a rotated `.env` in main also surfaces.
+  Deliberately *not* `wt step copy-ignored` (a deny-list that would drag
+  `node_modules/`), and worktrunk has nowhere to hang the rm-side guard.
+  `grove doctor` lists the configured paths, flagging any absent from the main
+  checkout, already tracked, or not gitignored.
+- **`grove sync [list|check|add|rm]`** — the same machinery as a verb. Bare
+  `grove sync` copies the missing paths into *this* worktree, covering the case
+  `grove go` structurally can't: you add `.env` to the main checkout after
+  spawning five agents, and the attach gate rightly refuses to re-run `grove go`
+  for any of them. `check` runs `grove rm`'s guard on demand and **exits 1** on
+  divergence, so it composes into scripts and hooks. `list` reports each path's
+  config *and* worktree state (in sync / not copied yet / differs), and is the
+  same renderer `grove doctor` uses. `add`/`rm [--local] <path>...` edit
+  `.grove.json` (or `.grove.local.json`) so hand-editing a JSON array is
+  optional, mirroring what `restyle --color` does for styling: `add` refuses a
+  tracked path outright and warns-but-writes on one that isn't gitignored or
+  doesn't exist yet, and `--local` **carries the effective list forward** rather
+  than writing a one-element array that would silently supersede the committed
+  one (jq's `*` replaces arrays).
+
 ### Fixed
+- **The teardown guard decided divergence from whether a diff *printed*, not from
+  git's exit status** — so `grove rm` deleted the worktree in three reachable
+  cases where `git diff --no-index` reports a difference while emitting nothing:
+  a file↔directory type change (exit 1, zero bytes), an unreadable file (exit
+  128, zero bytes), and a `.gitattributes` `diff=` driver that redacts both sides
+  to identical text. Comparison now goes through one `grove_sync_differs`
+  returning same / differs / **could-not-compare**, with the last failing closed
+  and `--no-textconv` so a redacting driver can't blind the guard protecting the
+  file. `grove sync check` and `grove sync list` share that function and can no
+  longer disagree about the same file.
+- **`sync.paths` is resolved as the union across roots**, not from a single one.
+  `.grove.local.json` is gitignored, so it exists only where it was written
+  (normally the main checkout) and is absent from every fresh worktree — a
+  worktree-rooted read resolved to *no paths at all*, silently disabling the
+  guard for exactly the `grove sync add --local` workflow. `grove rm` now unions
+  the invoking worktree, the worktree being torn down, and the main checkout.
+  The guard is monotone in candidates by design: an extra one costs a `git diff`
+  and is skipped when absent; a missing one loses a secret.
+- **`grove sync add` no longer promotes personal paths into the committed file.**
+  Seeding the write from the merged list ran the layering backwards, copying
+  `.grove.local.json` and XDG entries into the shared `.grove.json`. Only
+  `--local` seeds from the effective list (where array-replace semantics require
+  it); the committed file seeds from its own.
+- **`grove sync rm` reported success for a write that didn't take effect** when a
+  higher-precedence layer still listed the path. The effective list is now
+  re-derived after every write and any unmoved path is called out.
+- **A malformed `.grove.json` was silently overwritten**, discarding `color`,
+  `icon` and `agent` keys; the write now refuses. A wrong-typed `sync` key
+  (`{"sync": "x"}`) crashed jq with a raw error instead of degrading to "nothing
+  configured".
+- Diff rendering fixes: a **directory** `sync.path` showed anonymous hunks with no
+  filenames; a **mode-only** change printed an empty body under a message that
+  was factually wrong; **binary** files leaked the absolute paths the header
+  stripping exists to hide; `awk` aborted mid-stream on bytes invalid in the
+  ambient locale (now `LC_ALL=C`); and the "diff truncated" notice counted raw
+  lines rather than printed ones, so it could claim truncation that hadn't
+  happened.
+- `grove sync check|list` reject stray arguments instead of silently discarding
+  them, and a relative symlink that lands dangling in the worktree is warned
+  about.
 - `grove go` now delivers the prompt to the agent **via a temp file** instead of
   inlining it in the typed launch command (issue #26). cmux *types* the launch
   line into the new workspace's pty, whose canonical-mode input buffer caps a
