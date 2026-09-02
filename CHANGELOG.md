@@ -6,6 +6,23 @@ All notable changes to grove are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- **The env-stamp sweep now finds a tab dragged out of its repo group.** The
+  shared matcher's `GROVE_WORKTREE_PATH` fallback (issue #18) swept only the
+  repo group's members, so a workspace moved to another group — or to no group —
+  was invisible to it: `grove rm` reported "no cmux workspace attached" and left
+  the tab open, and the `grove go` gate could have spawned a duplicate. The
+  sweep now runs the repo group's members first, then every other workspace
+  (tabs whose `current_directory` matches the worktree ahead of the rest, so
+  the common case costs about one extra `workspace env` call). Safe by
+  construction: the stamp is a machine-unique canonicalized worktree path, so —
+  unlike the title match, which stays group-scoped — the wider reach cannot
+  false-match across repos. `grove rm`'s close line notes when the tab had left
+  the group, and refuses (with an explanation) to close a strayed tab that now
+  anchors some *other* group, since closing an anchor dissolves its group; if
+  the group listing itself failed, it declines to close a matched tab at all
+  rather than act without anchor knowledge.
+
 ### Added
 - **`sync.paths` — untracked files carried into worktrees, and guarded on the way
   out.** A new config key (any layer) names repo-relative gitignored paths —

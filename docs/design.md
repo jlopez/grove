@@ -31,10 +31,13 @@ whole dance.
    **scoped to the repo group's members** (cross-reference `workspace-group list --json`
    member refs against `workspace list --json` titles), so a same-named branch in another
    repo's group never false-matches. On a title miss, the **env fallback**: sweep the
-   group's members' stamped `GROVE_WORKTREE_PATH` (see [Workspace identity](#workspace-identity--the-grove_-env-stamp))
+   stamped `GROVE_WORKTREE_PATH` (see [Workspace identity](#workspace-identity--the-grove_-env-stamp))
    against the branch's worktree path — which the gate resolves first, read-only, from
-   `wt list` — so a manually-renamed tab no longer defeats the gate. Both missing (or no
-   worktree yet) → nothing attached → proceed. No group yet → same.
+   `wt list` — so a manually-renamed tab no longer defeats the gate. The sweep runs the
+   repo group's members first, then **every other workspace** (a tab dragged out of its
+   group, or orphaned by a dissolution, is still found): unlike a title, the stamp is a
+   machine-unique worktree path, so the wider reach cannot false-match across repos.
+   Both missing (or no worktree yet) → nothing attached → proceed. No group yet → same.
 2. **Resolve-or-create the worktree** — by branch/worktree existence:
    worktree exists (`wt list --format json` has a path) → **reuse** it, no `wt switch`;
    branch exists (`git show-ref --verify refs/heads/<branch>`) but no worktree →
@@ -143,7 +146,17 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    before step 5 deleted the directory**. That covers the motivating incident: a branch
    renamed after `grove go` keeps its creation-title tab *and* its original worktree dir name
    (wt doesn't move it), so the title misses but the path stamp still hits — the tab is
-   closed instead of left orphaned. Done **last**, so closing `grove`'s own tab can't abort
+   closed instead of left orphaned. The sweep reaches past the repo group's members to
+   **every workspace**, so a tab **dragged out of its group** is found and closed too (the
+   second incident: `grove rm` reported "no cmux workspace attached" to a tab sitting one
+   group over) — the close line then notes the tab had left the group. If such a strayed tab
+   now *anchors another group*, grove refuses to close it (closing an anchor dissolves its
+   group — the cmux contract below — and that group isn't grove's to manage) and says so.
+   And if the *group listing itself* failed while the workspaces listing answered, grove
+   declines to close a matched tab at all: it can't see any group's anchor, so it won't act
+   half-blind — the tab is left open with a message, restoring the pre-widening inertness
+   of exactly that state.
+   Done **last**, so closing `grove`'s own tab can't abort
    the removal above. Both title and stamp missing (legacy/unstamped tab) → no ref, skipped
    (fails safe).
 
