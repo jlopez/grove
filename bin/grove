@@ -648,20 +648,54 @@ grove_group_member_refs() {
      | (.member_workspace_refs // [])[]' 2>/dev/null
 }
 
-# grove_env_ref_in_group <cmux> <groups-json> <repo> <canon-path> — print the
-# ref of the member workspace of cmux group <repo> whose stamped
+# grove_env_sweep_refs <groups-json> <workspaces-json> <repo> <path> — print
+# every workspace ref in env-sweep order, one per line: the repo group's
+# members first (the cheap, common case), then every workspace OUTSIDE the
+# group — those whose current_directory equals <path> ahead of the rest, since
+# a tab dragged out of its group usually still sits in its worktree, making
+# the true match the first stranger swept. The sweep deliberately reaches
+# beyond the repo group (unlike the title matcher, which must stay
+# group-scoped because branch names collide across repos): the stamp it keys
+# on is a canonicalized worktree path, unique machine-wide, so a cross-repo
+# false match is impossible and the group fence would only re-lose the
+# moved-out tab this order exists to find. Pure (jq only); malformed listings
+# fail closed to empty output.
+grove_env_sweep_refs() {
+  printf '%s' "$2" | jq -r \
+    --argjson groups "$1" --arg repo "$3" --arg path "$4" '
+      (first(($groups.groups // [])[] | select(.name==$repo)) // {}
+       | (.member_workspace_refs // [])) as $members
+      | [ (.workspaces // [])[] ] as $all
+      | ($members
+         + [ $all[] | .ref as $r
+             | select(($members | index($r)) == null
+                      and (.current_directory // "") == $path) | $r ]
+         + [ $all[] | .ref as $r
+             | select(($members | index($r)) == null
+                      and (.current_directory // "") != $path) | $r ])
+      | .[]
+    ' 2>/dev/null
+}
+
+# grove_env_ref_sweep <cmux> <groups-json> <workspaces-json> <repo>
+# <canon-path> — print the ref of the workspace whose stamped
 # GROVE_WORKTREE_PATH env equals <canon-path>, or nothing. The env fallback of
 # the shared matcher (issue #18): titles are mutable (branch rename, manual tab
 # rename) but the worktree *path* survives both — wt keeps the original dir
 # name on a branch rename — so the create-time env stamp is the durable key.
+# Sweeps the repo group's members first, then every other workspace
+# (grove_env_sweep_refs — a tab dragged out of its group is still found; the
+# stamp's machine-wide uniqueness is what makes the wider sweep safe).
 # cmux intentionally omits env from `workspace list` (secrets policy), so this
-# costs one `workspace env` call per group member — fine on the title-miss
-# path, never for hot loops. Empty <canon-path> (no worktree resolved) yields
-# nothing without any cmux call; unstamped members (legacy, UI-created, or
-# adopted workspaces — env is create-time-only) and failed env reads are
+# costs one `workspace env` call per swept ref — fine on the title-miss
+# path, never for hot loops; the cwd-first ordering keeps the moved-out case
+# to about one stranger call, and the full sweep is only paid when no tab
+# matches anywhere. Empty <canon-path> (no worktree resolved) yields
+# nothing without any cmux call; unstamped workspaces (legacy, UI-created, or
+# adopted — env is create-time-only) and failed env reads are
 # skipped, so both cases degrade to today's fail-safe no-match.
-grove_env_ref_in_group() {
-  local cmux="$1" groups="$2" repo="$3" path="$4" ref envjson wpath
+grove_env_ref_sweep() {
+  local cmux="$1" groups="$2" workspaces="$3" repo="$4" path="$5" ref envjson wpath
   [ -n "$path" ] || return 0
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
@@ -674,23 +708,26 @@ grove_env_ref_in_group() {
       printf '%s\n' "$ref"
       return 0
     fi
-  done < <(grove_group_member_refs "$groups" "$repo")
+  done < <(grove_env_sweep_refs "$groups" "$workspaces" "$repo" "$path")
   return 0
 }
 
 # grove_workspace_for <cmux> <groups-json> <workspaces-json> <repo> <branch>
 # <canon-path> — the shared matcher (issue #18), used by the `grove go` attach
-# gate and `grove rm`'s close-target lookup. Print the ref of the repo-group
-# workspace attached to <branch>, or nothing:
+# gate and `grove rm`'s close-target lookup. Print the ref of the workspace
+# attached to <branch>, or nothing:
 #   1. title match first (pure, zero extra cmux calls — under the attach-gate
-#      invariant a title hit is always correct);
-#   2. on a miss, the env sweep keyed on the stamped GROVE_WORKTREE_PATH;
+#      invariant a title hit is always correct; group-scoped, since branch
+#      names collide across repos);
+#   2. on a miss, the env sweep keyed on the stamped GROVE_WORKTREE_PATH —
+#      repo-group members first, then every other workspace, so a tab dragged
+#      out of its group (or orphaned by a dissolution) is still found;
 #   3. both missing → empty, i.e. today's fail-safe behavior — permanently
 #      covers legacy/UI-created/adopted workspaces, which carry no stamp.
 grove_workspace_for() {
   local ref
   ref=$(grove_ref_in_group "$2" "$3" "$4" "$5")
-  [ -n "$ref" ] || ref=$(grove_env_ref_in_group "$1" "$2" "$4" "$6")
+  [ -n "$ref" ] || ref=$(grove_env_ref_sweep "$1" "$2" "$3" "$4" "$6")
   printf '%s' "$ref"
 }
 
@@ -1140,13 +1177,38 @@ grove_rm() {
   #    #18): title first, then the GROVE_WORKTREE_PATH env stamp — so a tab
   #    whose branch was renamed after `grove go` (the motivating incident: the
   #    title keeps the creation name, but the worktree path survives the
-  #    rename) is still found and closed instead of left orphaned. Both
+  #    rename) is still found and closed instead of left orphaned, and the
+  #    stamp sweep reaches beyond the repo group, so a tab dragged out of it
+  #    (the second incident: `grove rm` reported "no cmux workspace attached"
+  #    to a tab sitting one group over) is found too. Both
   #    missing → no ref (fails safe), leaving nothing to close.
   local groups workspaces ws
   groups=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json 2>/dev/null) || groups='{}'
   workspaces=$(CMUX_QUIET=1 "$CMUX" workspace list --json 2>/dev/null)   || workspaces='{}'
   ws=$(grove_workspace_for "$CMUX" "$groups" "$workspaces" "$REPO" "$branch" "$canon_wt")
   if [ -n "$ws" ]; then
+    # The env sweep can resolve a tab that was dragged OUT of the repo group
+    # (grove_env_ref_sweep) — say so in the close line, and guard the blast
+    # radius that reach creates: if the strayed tab now ANCHORS some other
+    # group, closing it would dissolve THAT group and orphan its members (the
+    # cmux contract, issue #22) — a call grove has no business making for a
+    # group it doesn't manage. Refuse and say why instead.
+    local away=""
+    grove_group_member_refs "$groups" "$REPO" | grep -Fxq "$ws" \
+      || away=" — tab had left group '$REPO'"
+    if [ -n "$away" ]; then
+      local other_anchor
+      other_anchor=$(printf '%s' "$groups" | jq -r --arg ws "$ws" --arg repo "$REPO" \
+        'first((.groups // [])[]
+               | select((.anchor_workspace_ref // "") == $ws and .name != $repo)
+               | .name) // empty' 2>/dev/null)
+      if [ -n "$other_anchor" ]; then
+        warn "workspace $ws ($branch) now anchors group '$other_anchor' — leaving it open"
+        warn "(closing it would dissolve that group and orphan its members;"
+        warn " re-anchor or move it, then close the tab yourself)"
+        return 0
+      fi
+    fi
     # Anchor guard (issue #22). The primary-checkout guard above assumes the
     # group's anchor is the repo-header workspace at the main checkout — true for
     # grove-created groups, but a legacy or UI-created group can be anchored on
@@ -1165,7 +1227,7 @@ grove_rm() {
         return 0
       fi
     fi
-    info "closing workspace ${_c_bld}$ws${_c_rst} ($branch)…"
+    info "closing workspace ${_c_bld}$ws${_c_rst} ($branch$away)…"
     CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
       || warn "could not close workspace $ws (already gone?)"
   else
