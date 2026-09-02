@@ -152,6 +152,10 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    group over) — the close line then notes the tab had left the group. If such a strayed tab
    now *anchors another group*, grove refuses to close it (closing an anchor dissolves its
    group — the cmux contract below — and that group isn't grove's to manage) and says so.
+   And if the *group listing itself* failed while the workspaces listing answered, grove
+   declines to close a matched tab at all: it can't see any group's anchor, so it won't act
+   half-blind — the tab is left open with a message, restoring the pre-widening inertness
+   of exactly that state.
    Done **last**, so closing `grove`'s own tab can't abort
    the removal above. Both title and stamp missing (legacy/unstamped tab) → no ref, skipped
    (fails safe).

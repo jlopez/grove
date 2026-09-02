@@ -19,7 +19,9 @@ All notable changes to grove are documented here. Format follows
   unlike the title match, which stays group-scoped — the wider reach cannot
   false-match across repos. `grove rm`'s close line notes when the tab had left
   the group, and refuses (with an explanation) to close a strayed tab that now
-  anchors some *other* group, since closing an anchor dissolves its group.
+  anchors some *other* group, since closing an anchor dissolves its group; if
+  the group listing itself failed, it declines to close a matched tab at all
+  rather than act without anchor knowledge.
 
 ### Added
 - **`sync.paths` — untracked files carried into worktrees, and guarded on the way

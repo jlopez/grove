@@ -595,6 +595,82 @@ JSON
   [ -z "$(grove_env_sweep_refs '{}' '{}' grove /repos/wt/strayed)" ]
 }
 
+@test "env_sweep_refs: a workspace without a ref is dropped, never emitted as 'null'" {
+  set +eu
+  source "$GROVE"
+  # jq -r prints a null ref as the literal string "null", which the sweep's
+  # [ -n "$ref" ] guard would NOT catch — it would burn a `workspace env null`
+  # call. Refless entries are filtered out of the ordering instead.
+  local ws='{ "workspaces": [ { "title": "ghost" },
+                              { "ref": "workspace:61", "current_directory": "/x" } ] }'
+  [ "$(grove_env_sweep_refs '{ "groups": [] }' "$ws" grove /x)" = "workspace:61" ]
+}
+
+# --- grove rm's strayed-tab close guards (pure halves) -----------------------
+# The close path for a tab found OUTSIDE the repo group (the widened sweep's
+# new reach) makes two pure decisions: is the tab still a member (the "tab had
+# left group" annotation keys on this), and does it anchor some OTHER group
+# (then the close is refused — dissolving a group grove doesn't manage). The
+# cmux side of the close stays manually validated, per this repo's testing
+# policy; these pin the decisions themselves.
+
+@test "member_of_group: member → yes; stranger, unknown group, malformed → no" {
+  set +eu
+  source "$GROVE"
+  grove_member_of_group "$(_groups_json)" grove workspace:34
+  ! grove_member_of_group "$(_groups_json)" grove workspace:61
+  ! grove_member_of_group "$(_groups_json)" nope workspace:34
+  ! grove_member_of_group '{}' grove workspace:34
+}
+
+_anchor_guard_groups_json() {
+  cat <<'JSON'
+{ "groups": [
+  { "ref": "workspace_group:1", "name": "grove",
+    "anchor_workspace_ref": "workspace:19",
+    "member_workspace_refs": ["workspace:19", "workspace:34"] },
+  { "ref": "workspace_group:2", "name": "hold",
+    "anchor_workspace_ref": "workspace:50",
+    "member_workspace_refs": ["workspace:50"] }
+] }
+JSON
+}
+
+@test "anchor_of_other_group: names the other group a strayed tab anchors" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:50)" = "hold" ]
+}
+
+@test "anchor_of_other_group: the repo group's own anchor is not 'other'" {
+  set +eu
+  source "$GROVE"
+  # workspace:19 anchors the repo's OWN group — that is issue #22's re-anchor
+  # path, not this refusal's business.
+  [ -z "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:19)" ]
+}
+
+@test "anchor_of_other_group: a tab that anchors nothing → empty" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:34)" ]
+}
+
+@test "anchor_of_other_group: a NAMELESS group still triggers the refusal" {
+  set +eu
+  source "$GROVE"
+  # A group with no usable name must yield SOME identifier — an empty match
+  # here would skip the refusal and dissolve the group on close.
+  local g='{ "groups": [ { "ref": "workspace_group:9", "anchor_workspace_ref": "workspace:50" } ] }'
+  [ "$(grove_anchor_of_other_group "$g" grove workspace:50)" = "workspace_group:9" ]
+}
+
+@test "anchor_of_other_group: malformed listing → empty (fails closed)" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_anchor_of_other_group 'not json' grove workspace:50)" ]
+}
+
 @test "env_ref_sweep: matches the stamped GROVE_WORKTREE_PATH (skips unstamped)" {
   set +eu
   source "$GROVE"
