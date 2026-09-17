@@ -225,6 +225,147 @@ grove_sync_copy() {
   return 0
 }
 
+# ---- dotenv-aware comparison and merge --------------------------------------
+# `.env` is the overwhelmingly common sync.path, and it isn't a blob: it's a set
+# of keys. Two checkouts that each added their own key have no conflict, they
+# have a union — so when both sides of a divergence parse as dotenv, grove merges
+# the key sets instead of reporting a wall of diff, and only a key whose *value*
+# differs is a real conflict. The parse is deliberately strict: anything that
+# isn't blank / `# comment` / `[export ]KEY=VALUE` (multi-line values, JSON,
+# binary, a symlink) falls back to the old "they differ, go look" path. The merge
+# is a convenience for the shape it recognizes, never a guess about a file it
+# doesn't.
+
+GROVE_DOTENV_KEYS=()
+# Associative arrays are bash 4+, as is the `mapfile` grove already relies on.
+# Guarded so the script still *loads* under macOS's system bash 3.2 (`grove
+# version` keeps working); main() refuses the run with a real message instead.
+if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
+  declare -A GROVE_DOTENV_VAL=()
+  declare -A GROVE_DOTENV_LINE=()
+fi
+
+# grove_dotenv_norm <raw-value> — the value as a loader would see it: surrounding
+# whitespace dropped, one layer of matching quotes stripped. So `KEY=foo`,
+# `KEY="foo"` and `KEY='foo'` are the same value and not a conflict — quoting
+# style is exactly the kind of difference two hands introduce independently.
+grove_dotenv_norm() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"                 # ltrim
+  v="${v%"${v##*[![:space:]]}"}"                 # rtrim
+  case "$v" in
+    '"'*'"') v=${v:1:${#v}-2} ;;
+    "'"*"'") v=${v:1:${#v}-2} ;;
+  esac
+  printf '%s' "$v"
+}
+
+# grove_dotenv_scan <file> — parse <file> into GROVE_DOTENV_KEYS (first-seen
+# order), GROVE_DOTENV_VAL[key] (normalized) and GROVE_DOTENV_LINE[key] (the
+# verbatim source line, so a merge carries the author's own quoting and `export`
+# prefix across rather than re-rendering it). Returns 1 unless *every* line is
+# blank, a comment or an assignment — a partial parse would merge half a file.
+grove_dotenv_scan() {
+  local f="$1" line key
+  GROVE_DOTENV_KEYS=(); GROVE_DOTENV_VAL=(); GROVE_DOTENV_LINE=()
+  [ -L "$f" ] && return 1        # a symlinked .env is a deliberate shared file
+  [ -f "$f" ] || return 1
+  # NUL means binary, and `read` would silently swallow it — reject outright
+  # rather than "parse" a file whose bytes we never saw.
+  [ -z "$(LC_ALL=C tr -dc '\000' < "$f" | tr '\000' 'x')" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}                                        # CRLF
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      key="${BASH_REMATCH[2]}"
+      [ -n "${GROVE_DOTENV_VAL[$key]+x}" ] || GROVE_DOTENV_KEYS+=("$key")
+      GROVE_DOTENV_VAL["$key"]=$(grove_dotenv_norm "${BASH_REMATCH[3]}")
+      GROVE_DOTENV_LINE["$key"]="$line"
+    else
+      return 1
+    fi
+  done < "$f"
+  return 0
+}
+
+# grove_dotenv_same <a> <b> — both parse as dotenv *and* define the same keys
+# with the same values. This is the "differs only in comments, order or quoting"
+# case, and it is what lets `grove sync check` (and the `grove rm` guard) pass
+# after a merge: the merge appends to each file in place, so the two never become
+# byte-identical, but no key — no *secret* — lives on one side only, which is the
+# question the guard actually asks.
+grove_dotenv_same() {
+  local a="$1" b="$2" k n
+  local -A a_val=()
+  grove_dotenv_scan "$a" || return 1
+  for k in ${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"}; do
+    a_val["$k"]="${GROVE_DOTENV_VAL[$k]}"
+  done
+  n=${#a_val[@]}
+  grove_dotenv_scan "$b" || return 1
+  [ "${#GROVE_DOTENV_KEYS[@]}" = "$n" ] || return 1
+  for k in ${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"}; do
+    [ -n "${a_val[$k]+x}" ] || return 1
+    [ "${a_val[$k]}" = "${GROVE_DOTENV_VAL[$k]}" ] || return 1
+  done
+  return 0
+}
+
+# grove_dotenv_append <file> <line>... — append lines, first repairing a missing
+# final newline so the appended key can't glue itself onto the last one.
+grove_dotenv_append() {
+  local f="$1"; shift
+  [ $# -gt 0 ] || return 0
+  if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then printf '\n' >> "$f"; fi
+  printf '%s\n' "$@" >> "$f"
+}
+
+# grove_dotenv_merge <a> <b> — union the key sets of two dotenv files *in place*.
+# Keys only in <a> are appended to <b> and vice versa, verbatim, so each file
+# keeps its own order, comments and quoting — a merge never rewrites a line
+# someone wrote. A key both sides define with different values is a conflict:
+# nothing is written at all (a half-merged .env is worse than an unmerged one)
+# and the names land in GROVE_DOTENV_CONFLICTS.
+# Exit: 0 merged, 1 conflict, 2 one side isn't dotenv-shaped.
+GROVE_DOTENV_CONFLICTS=()
+GROVE_DOTENV_CONFLICT_LEN_A=()
+GROVE_DOTENV_CONFLICT_LEN_B=()
+grove_dotenv_merge() {
+  local a="$1" b="$2" k
+  local a_keys=() b_keys=() add_a=() add_b=()
+  local -A a_val=() a_line=() b_val=() b_line=()
+  GROVE_DOTENV_CONFLICTS=(); GROVE_DOTENV_CONFLICT_LEN_A=(); GROVE_DOTENV_CONFLICT_LEN_B=()
+  grove_dotenv_scan "$a" || return 2
+  a_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
+  for k in ${a_keys[@]+"${a_keys[@]}"}; do
+    a_val["$k"]="${GROVE_DOTENV_VAL[$k]}"; a_line["$k"]="${GROVE_DOTENV_LINE[$k]}"
+  done
+  grove_dotenv_scan "$b" || return 2
+  b_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
+  for k in ${b_keys[@]+"${b_keys[@]}"}; do
+    b_val["$k"]="${GROVE_DOTENV_VAL[$k]}"; b_line["$k"]="${GROVE_DOTENV_LINE[$k]}"
+  done
+  for k in ${a_keys[@]+"${a_keys[@]}"}; do
+    [ -n "${b_val[$k]+x}" ] || continue
+    [ "${a_val[$k]}" = "${b_val[$k]}" ] && continue
+    # Lengths, not values: enough to tell "mine is the long one" apart from a
+    # typo, without putting either secret on screen. See grove_sync_unit.
+    GROVE_DOTENV_CONFLICTS+=("$k")
+    GROVE_DOTENV_CONFLICT_LEN_A+=("${#a_val[$k]}")
+    GROVE_DOTENV_CONFLICT_LEN_B+=("${#b_val[$k]}")
+  done
+  [ ${#GROVE_DOTENV_CONFLICTS[@]} -eq 0 ] || return 1
+  for k in ${a_keys[@]+"${a_keys[@]}"}; do
+    [ -n "${b_val[$k]+x}" ] || add_b+=("${a_line[$k]}")
+  done
+  for k in ${b_keys[@]+"${b_keys[@]}"}; do
+    [ -n "${a_val[$k]+x}" ] || add_a+=("${b_line[$k]}")
+  done
+  grove_dotenv_append "$b" ${add_b[@]+"${add_b[@]}"}
+  grove_dotenv_append "$a" ${add_a[@]+"${add_a[@]}"}
+  return 0
+}
+
 # grove_sync_resolve_paths <root>... — set GROVE_SYNC_PATHS to the *union* of
 # sync.paths as resolved at each <root>, in first-seen order. Every consumer
 # below reads that array rather than the config directly.
@@ -273,6 +414,11 @@ grove_sync_differs() {
   local rc=0
   git --no-pager diff --no-index --no-ext-diff --no-textconv --quiet \
     -- "$1" "$2" >/dev/null 2>&1 || rc=$?
+  # One narrow exception to "bytes decide": two dotenv files with the same keys
+  # and the same values differ only in comments, order or quoting — exactly what
+  # a key merge leaves behind, and not a secret that exists on one side only. The
+  # parse is strict and file-only, so nothing git couldn't read gets here.
+  if [ "$rc" = 1 ] && grove_dotenv_same "$1" "$2"; then return 0; fi
   [ "$rc" -le 1 ] && return "$rc"
   return 2                              # git errored — fail closed, never "same"
 }
@@ -285,11 +431,10 @@ grove_sync_differs() {
 # summary only (the --force path, where the diff would just be noise).
 # Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
 grove_sync_check() {
-  local src="$1" dst="$2" quiet="${3:-}" p d body rc diverged=0
-  local paths=() color=never max=40
+  local src="$1" dst="$2" quiet="${3:-}" p rc diverged=0
+  local paths=()
   paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
   [ ${#paths[@]} -gt 0 ] || return 0
-  [ -t 2 ] && color=always
   for p in "${paths[@]}"; do
     grove_sync_path_ok "$p" || continue
     [ -e "$dst/$p" ] || continue          # already gone from the worktree → nothing to lose
@@ -312,21 +457,31 @@ grove_sync_check() {
       continue
     fi
     warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout (- main, + worktree):"
-    # A *display* diff — divergence was already decided above, so this one is
-    # allowed to come back empty (a type change prints nothing).
-    d=$(git --no-pager diff --no-index --no-ext-diff --no-textconv "--color=$color" \
-          -- "$src/$p" "$dst/$p" 2>/dev/null) || true
-    body=$(grove_sync_diff_body "$d" "$src/$p" "$dst/$p")
-    if [ -z "$body" ]; then
-      printf '    %s(no textual diff — the two are not the same kind of file)%s\n' \
-        "$_c_dim" "$_c_rst" >&2
-      continue
-    fi
-    { printf '%s\n' "$body" | head -n "$max" || true; } >&2
-    [ "$(printf '%s\n' "$body" | wc -l)" -gt "$max" ] \
-      && printf '    %s… diff truncated%s\n' "$_c_dim" "$_c_rst" >&2
+    grove_sync_show_diff "$src/$p" "$dst/$p"
   done
   return $diverged
+}
+
+# grove_sync_show_diff <a> <b> — print the colored `git diff --no-index` body for
+# a divergence someone already decided *is* one, so this one is allowed to come
+# back empty (a type change prints nothing). Truncated, because the point is a
+# judgement call ("I don't care about that line"), not a full review.
+grove_sync_show_diff() {
+  local a="$1" b="$2" color=never max=40 d body
+  [ -t 2 ] && color=always
+  d=$(git --no-pager diff --no-index --no-ext-diff --no-textconv "--color=$color" \
+        -- "$a" "$b" 2>/dev/null) || true
+  body=$(grove_sync_diff_body "$d" "$a" "$b")
+  if [ -z "$body" ]; then
+    printf '    %s(no textual diff — the two are not the same kind of file)%s\n' \
+      "$_c_dim" "$_c_rst" >&2
+    return 0
+  fi
+  { printf '%s\n' "$body" | head -n "$max" || true; } >&2
+  if [ "$(printf '%s\n' "$body" | wc -l)" -gt "$max" ]; then
+    printf '    %s… diff truncated%s\n' "$_c_dim" "$_c_rst" >&2
+  fi
+  return 0
 }
 
 # grove_sync_diff_body <diff> <src-path> <dst-path> — strip git's file headers
@@ -348,6 +503,16 @@ grove_sync_diff_body() {
     function plain(s) { gsub(e "\\[[0-9;]*m", "", s); return s }
     {
       l = plain($0)
+      if (l ~ /^@@ /) {
+        # git appends "function context" to a hunk header: the nearest preceding
+        # line that looks like a definition. In a .env that is *the line above the
+        # change* — i.e. a neighbouring secret, printed verbatim into a terminal
+        # that may be screen-shared or logged. Keep the line numbers, drop the rest.
+        hdr = l
+        if (match(hdr, /^@@[^@]*@@/)) hdr = substr(hdr, RSTART, RLENGTH)
+        if (index($0, e) > 0) print e "[36m" hdr e "[m"; else print hdr
+        next
+      }
       if (l ~ /^Binary files /) {
         name = l; sub(/^Binary files .* and b/, "", name); sub(/ differ$/, "", name)
         idx = index(name, dp); if (idx) name = substr(name, idx + length(dp))
@@ -372,6 +537,161 @@ grove_sync_diff_body() {
     }'
 }
 
+# ---- bidirectional gap-fill (`grove sync`) ----------------------------------
+# `grove go` copies main → worktree, because at spawn time that is the only
+# direction that exists. But a path is naturally *born* on the branch that
+# introduces it: `grove sync add 260916-book-club/.env` from a feature worktree
+# used to print "absent from the main checkout (skipped)" and leave `grove rm`
+# demanding --force, because main was assumed to be the origin of every secret
+# (#34). It isn't. So bare `grove sync` fills the gap in whichever direction it
+# finds it — with the never-overwrite rule intact: a gap is filled, an existing
+# file is never clobbered. The only thing that changed is which side may be the
+# source.
+#
+# Why no `grove sync push`. "Present on one side, absent on the other" has
+# exactly one safe resolution, so a second verb would only be a second word to
+# remember before getting the one outcome you wanted.
+
+GROVE_SYNC_TO_WT=(); GROVE_SYNC_TO_MAIN=(); GROVE_SYNC_MERGED=()
+GROVE_SYNC_ABSENT=(); GROVE_SYNC_TRACKED=(); GROVE_SYNC_UNIGNORED=()
+GROVE_SYNC_DIVERGED=(); GROVE_SYNC_CONFLICTED=()
+
+# grove_sync_entries <dir-a> <dir-b> — the union of file/symlink entries under
+# either directory, relative, first-seen order. A directory sync.path is handled
+# **per entry** so it behaves like a bag of files rather than an all-or-nothing
+# blob: each entry can be gap-filled (or merged) on its own side.
+grove_sync_entries() {
+  local d
+  for d in "$1" "$2"; do
+    [ -d "$d" ] || continue
+    # NUL-delimited: a filename may legally contain a newline, and a line-based
+    # read would turn one entry into two bogus ones.
+    ( cd "$d" 2>/dev/null && find . -mindepth 1 \( -type f -o -type l \) -print0 ) 2>/dev/null
+  done
+}
+
+# grove_sync_take <src-root> <dst-root> <path> <to_wt|to_main> — copy one missing
+# entry across. Same disqualifiers as grove_sync_copy (tracked, not gitignored),
+# checked on **both** roots for the ignore rule: the receiving side is the one
+# that would be left dirty, and its .gitignore may differ from the sender's since
+# the two are on different branches.
+grove_sync_take() {
+  local src="$1" dst="$2" p="$3" bucket="$4"
+  if [ -n "$(git -C "$src" ls-files -- "$p" 2>/dev/null)" ] \
+     || [ -n "$(git -C "$dst" ls-files -- "$p" 2>/dev/null)" ]; then
+    # Tracked on *either* side. The receiving side matters too: a path git tracks
+    # there but that is currently missing from the working tree reads as a gap,
+    # and filling it would silently resurrect a file git is managing.
+    GROVE_SYNC_TRACKED+=("$p"); return 0
+  fi
+  if ! git -C "$src" check-ignore -q -- "$p" 2>/dev/null \
+     || ! git -C "$dst" check-ignore -q -- "$p" 2>/dev/null; then
+    GROVE_SYNC_UNIGNORED+=("$p"); return 0
+  fi
+  if ! mkdir -p -- "$(dirname -- "$dst/$p")" 2>/dev/null; then
+    warn "sync.paths: could not create the parent directory for '$p'"; return 0
+  fi
+  if ! cp -Rp -- "$src/$p" "$dst/$p" 2>/dev/null; then
+    warn "sync.paths: could not copy '$p'"; return 0
+  fi
+  # cp -Rp keeps a symlink a symlink (deliberate — see grove_sync_copy), but a
+  # *relative* link resolves against a different depth on the other side.
+  if [ -L "$dst/$p" ] && [ ! -e "$dst/$p" ]; then
+    warn "sync.paths: '$p' is a symlink that doesn't resolve on the receiving side"
+  fi
+  case "$bucket" in
+    to_wt)   GROVE_SYNC_TO_WT+=("$p") ;;
+    to_main) GROVE_SYNC_TO_MAIN+=("$p") ;;
+  esac
+  return 0
+}
+
+# grove_sync_unit <main> <wt> <path> — resolve one entry, in whichever direction
+# it needs. Recurses into a directory present on both sides. Appends to the
+# report arrays above; never fatal.
+grove_sync_unit() {
+  local main="$1" wt="$2" p="$3" rc=0 mrc=0 e i entries=()
+  local in_main=0 in_wt=0
+  local -A seen_entry=()
+  if [ -e "$main/$p" ] || [ -L "$main/$p" ]; then in_main=1; fi
+  if [ -e "$wt/$p" ]   || [ -L "$wt/$p" ];   then in_wt=1;   fi
+
+  if [ "$in_main" = 0 ] && [ "$in_wt" = 0 ]; then GROVE_SYNC_ABSENT+=("$p"); return 0; fi
+  if [ "$in_wt" = 0 ];   then grove_sync_take "$main" "$wt" "$p" to_wt;   return 0; fi
+  if [ "$in_main" = 0 ]; then grove_sync_take "$wt" "$main" "$p" to_main; return 0; fi
+
+  # Both sides present. A directory on both sides is a bag of entries, not a unit.
+  if [ -d "$main/$p" ] && [ -d "$wt/$p" ] && [ ! -L "$main/$p" ] && [ ! -L "$wt/$p" ]; then
+    while IFS= read -r -d '' e; do
+      e=${e#./}
+      [ -n "$e" ] || continue
+      [ -n "${seen_entry[$e]+x}" ] && continue
+      seen_entry["$e"]=1
+      entries+=("$p/$e")
+    done < <(grove_sync_entries "$main/$p" "$wt/$p")
+    for e in ${entries[@]+"${entries[@]}"}; do grove_sync_unit "$main" "$wt" "$e"; done
+    return 0
+  fi
+
+  grove_sync_differs "$main/$p" "$wt/$p" && return 0
+  rc=$?
+  if [ "$rc" = 2 ]; then
+    warn "sync: ${_c_bld}$p${_c_rst} could not be compared with the main checkout — left alone"
+    GROVE_SYNC_DIVERGED+=("$p"); return 0
+  fi
+  grove_dotenv_merge "$main/$p" "$wt/$p" || mrc=$?
+  case "$mrc" in
+    0) GROVE_SYNC_MERGED+=("$p") ;;
+    1) GROVE_SYNC_CONFLICTED+=("$p")
+       # Deliberately *not* the diff. A conflict in a .env is about keys, and the
+       # keys are all you need to go reconcile it by hand; printing the two values
+       # would spray secrets — the conflicting one and, through git's context
+       # lines, the neighbours that agree — into a terminal that may be
+       # screen-shared or logged. `grove sync check` still shows the full diff
+       # when you ask for it, which is the right place for an explicit choice.
+       warn "sync: ${_c_bld}$p${_c_rst} sets these keys differently on the two sides (skipped):"
+       for i in "${!GROVE_DOTENV_CONFLICTS[@]}"; do
+         printf '    %s%s%s: differs (main %s chars, worktree %s chars)\n' \
+           "$_c_bld" "${GROVE_DOTENV_CONFLICTS[$i]}" "$_c_rst" \
+           "${GROVE_DOTENV_CONFLICT_LEN_A[$i]}" "${GROVE_DOTENV_CONFLICT_LEN_B[$i]}" >&2
+       done
+       warn "sync: values are not printed — 'grove sync check' shows the full diff" ;;
+    *) GROVE_SYNC_DIVERGED+=("$p") ;;
+  esac
+  return 0
+}
+
+# grove_sync_exchange <main> <wt> — the bare `grove sync` engine: gap-fill every
+# configured path in both directions, merging dotenv key sets where both sides
+# exist and differ. Returns 1 if any path had conflicting values (that path is
+# left untouched; every other path is still processed — a conflict in one secret
+# must not stop the other four from being synced).
+grove_sync_exchange() {
+  local main="$1" wt="$2" p
+  local paths=()
+  paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
+  GROVE_SYNC_TO_WT=(); GROVE_SYNC_TO_MAIN=(); GROVE_SYNC_MERGED=()
+  GROVE_SYNC_ABSENT=(); GROVE_SYNC_TRACKED=(); GROVE_SYNC_UNIGNORED=()
+  GROVE_SYNC_DIVERGED=(); GROVE_SYNC_CONFLICTED=()
+  [ ${#paths[@]} -gt 0 ] || return 0
+  for p in "${paths[@]}"; do
+    if ! grove_sync_path_ok "$p"; then
+      warn "sync.paths: ignoring '$p' — must be a relative path inside the repo"
+      continue
+    fi
+    grove_sync_unit "$main" "$wt" "$p"
+  done
+  [ ${#GROVE_SYNC_TO_WT[@]}   -gt 0 ] && info "synced from the main checkout: ${GROVE_SYNC_TO_WT[*]}"
+  [ ${#GROVE_SYNC_TO_MAIN[@]} -gt 0 ] && info "seeded the main checkout from this worktree: ${GROVE_SYNC_TO_MAIN[*]}"
+  [ ${#GROVE_SYNC_MERGED[@]}  -gt 0 ] && info "merged dotenv keys: ${GROVE_SYNC_MERGED[*]}"
+  [ ${#GROVE_SYNC_ABSENT[@]}  -gt 0 ] && warn "sync.paths present in neither checkout (skipped): ${GROVE_SYNC_ABSENT[*]}"
+  [ ${#GROVE_SYNC_TRACKED[@]} -gt 0 ] && warn "sync.paths tracked by git (skipped — git already carries them): ${GROVE_SYNC_TRACKED[*]}"
+  [ ${#GROVE_SYNC_UNIGNORED[@]} -gt 0 ] && warn "sync.paths not gitignored on both sides (skipped — copying would leave a checkout dirty and block 'wt remove'): ${GROVE_SYNC_UNIGNORED[*]}"
+  [ ${#GROVE_SYNC_DIVERGED[@]} -gt 0 ] && warn "sync.paths differ on both sides and aren't dotenv (left alone — see 'grove sync check'): ${GROVE_SYNC_DIVERGED[*]}"
+  [ ${#GROVE_SYNC_CONFLICTED[@]} -gt 0 ] && return 1
+  return 0
+}
+
 # grove_sync_list <main> [dst] — print one status row per configured sync.path.
 # With <dst> (a worktree that isn't the main checkout) each row also reports the
 # worktree's side: in sync / not copied yet / differs. Returns 1 if any path is
@@ -389,8 +709,15 @@ grove_sync_list() {
       printf '  %s✗%s %s %s(must be a relative path inside the repo)%s\n' \
         "$_c_red" "$_c_rst" "$p" "$_c_dim" "$_c_rst"; bad=1
     elif [ -z "$main" ] || [ ! -e "$main/$p" ]; then
-      printf '  %s!%s %s %s(absent from the main checkout — nothing to copy)%s\n' \
-        "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
+      # Absent from main is no longer a dead end: if this worktree has it, the
+      # worktree is the source and `grove sync` seeds main from here (#34).
+      if [ -n "$dst" ] && { [ -e "$dst/$p" ] || [ -L "$dst/$p" ]; }; then
+        printf '  %s!%s %s %s(only in this worktree — run '"'"'grove sync'"'"' to seed the main checkout)%s\n' \
+          "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
+      else
+        printf '  %s!%s %s %s(absent from the main checkout — nothing to copy)%s\n' \
+          "$_c_ylw" "$_c_rst" "$p" "$_c_dim" "$_c_rst"
+      fi
     elif [ -n "$(git -C "$main" ls-files -- "$p" 2>/dev/null)" ]; then
       printf '  %s✗%s %s %s(tracked by git — git already carries it)%s\n' \
         "$_c_red" "$_c_rst" "$p" "$_c_dim" "$_c_rst"; bad=1
@@ -1279,7 +1606,12 @@ grove_sync() {
   esac
 
   case "$sub" in
-    copy)  grove_sync_copy "$canon_repo" "$canon_wt"
+    copy)  local xrc=0
+           grove_sync_exchange "$canon_repo" "$canon_wt" || xrc=$?
+           if [ "$xrc" != 0 ]; then
+             err "sync incomplete — reconcile the conflicting keys above by hand, then re-run"
+             return 1
+           fi
            info "sync complete for ${_c_bld}$(basename "$canon_wt")${_c_rst}" ;;
     check) if grove_sync_check "$canon_repo" "$canon_wt"; then
              info "all synced paths match the main checkout"
@@ -1313,17 +1645,41 @@ grove_sync() {
             || die "grove sync add: '$p' must be a relative path inside the repo"
           [ -n "$(git -C "$canon_repo" ls-files -- "$p" 2>/dev/null)" ] \
             && die "grove sync add: '$p' is tracked by git — git already carries it into every worktree"
+          [ -n "$(git -C "$canon_wt" ls-files -- "$p" 2>/dev/null)" ] \
+            && die "grove sync add: '$p' is tracked by git on this branch — git already carries it"
           git -C "$canon_repo" check-ignore -q -- "$p" 2>/dev/null \
             || warn "'$p' is not gitignored — copying it would leave the worktree dirty and block 'wt remove'"
-          [ -e "$canon_repo/$p" ] \
-            || warn "'$p' does not exist in the main checkout yet — nothing to copy until it does"
+          # Either side may be the origin now (#34), so "nothing to copy" is only
+          # true when the path exists in neither.
+          { [ -e "$canon_repo/$p" ] || [ -e "$canon_wt/$p" ]; } \
+            || warn "'$p' exists in neither checkout yet — nothing to copy until it does"
         done
       fi
       grove_sync_write "$WORKTREE_ROOT" "$local_layer" "$sub" "${args[@]}"
       grove_sync_resolve_paths "$WORKTREE_ROOT" "$canon_repo"
+      # `add` seeds immediately, so the common case ("this branch was born with a
+      # .env") is one command rather than add-then-sync. Only the paths just
+      # added, and only when there's a worktree distinct from the main checkout.
+      local arc=0
+      if [ "$sub" = add ] && [ "$canon_wt" != "$canon_repo" ]; then
+        local eff=() c q
+        eff=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
+        GROVE_SYNC_PATHS=()
+        for q in "${args[@]}"; do
+          for c in ${eff[@]+"${eff[@]}"}; do
+            [ "$c" = "$q" ] && { GROVE_SYNC_PATHS+=("$q"); break; }
+          done
+        done
+        grove_sync_exchange "$canon_repo" "$canon_wt" || arc=$?
+        GROVE_SYNC_PATHS=(${eff[@]+"${eff[@]}"})
+      fi
       printf '%ssync.paths%s %s(from %s)%s\n' \
         "$_c_bld" "$_c_rst" "$_c_dim" "$canon_repo" "$_c_rst"
-      grove_sync_list "$canon_repo" "$canon_wt" || true ;;
+      grove_sync_list "$canon_repo" "$canon_wt" || true
+      if [ "$arc" != 0 ]; then
+        err "sync incomplete — reconcile the conflicting keys above by hand, then re-run 'grove sync'"
+        return 1
+      fi ;;
   esac
 }
 
@@ -1497,9 +1853,12 @@ ${_c_bld}Usage:${_c_rst}
                                   re-anchored to the repo header first (a group is
                                   never dissolved; refuses to close on failure).
   grove sync [list|check|add|rm]  Manage the untracked paths carried into worktrees
-                                  (sync.paths — .env & friends). Bare 'sync' copies
-                                  the missing ones from the main checkout into this
-                                  worktree (what 'grove go' does at spawn, on demand);
+                                  (sync.paths — .env & friends). Bare 'sync' fills the
+                                  gaps in both directions: missing here are copied from
+                                  the main checkout, missing there are seeded from this
+                                  worktree, and a .env both sides have gets its keys
+                                  merged (a key with two different values is left alone
+                                  and exits 1). Nothing is ever overwritten.
                                   'check' diffs them against the main checkout and
                                   exits 1 if any differ (what 'grove rm' guards on);
                                   'list' shows each path's config + worktree state;
@@ -1549,6 +1908,8 @@ EOF
 }
 
 main() {
+  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
+    || die "grove needs bash 4+ (running ${BASH_VERSION:-unknown}) — 'brew install bash'"
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     go)            grove_go "$@" ;;
