@@ -22,7 +22,8 @@ All notable changes to grove are documented here. Format follows
   and `wt remove`'s dirty-tree refusal is structurally blind to it (it's
   gitignored, therefore never "dirty"). So `grove rm` now diffs each synced path
   against the main checkout **before** removing anything and refuses if any
-  differs, printing a **colored `git diff`** per path — enough to judge "I don't
+  differs, reporting per path *what* differs — keys and lengths, never values
+  (`--unmask` prints the real colored `git diff`) — enough to judge "I don't
   care about that line" and re-run with `--force`, which removes anyway but keeps
   a one-line warning per diverged path. The check is deliberately stateless: it
   compares against the main checkout rather than a hash recorded at copy time, so
@@ -47,6 +48,40 @@ All notable changes to grove are documented here. Format follows
   one (jq's `*` replaces arrays).
 
 ### Fixed
+- **An empty dotenv placeholder was a conflict, not a gap to fill**
+  ([#36](https://github.com/jlopez/grove/issues/36)). `.env.example` ships
+  `DEEPINFRA_API_KEY=`, the main checkout inherits the empty line, the real key
+  gets pasted into the worktree — and `grove sync` reported `differs (main 0
+  chars, worktree 32 chars)` and refused. Empty (`KEY=`, `KEY=""`, `KEY=''`,
+  `KEY= # paste here`) on one side and set on the other is now the placeholder
+  being **filled**, in either direction: the empty line is replaced in place by
+  the other side's (position and the comment above it kept, an `export` prefix
+  and CRLF preserved), and the report names the key, never the value. Empty on
+  both sides is nothing to fill. Only two *different non-empty* values conflict,
+  and a conflict still writes nothing — not even the fills. Values now also
+  compare with an unquoted trailing `# comment` dropped (bash / python-dotenv
+  semantics), so `KEY=foo # prod` and `KEY=foo` agree.
+- **`grove sync check` and the `grove rm` guard printed the secrets they exist
+  to protect** ([#37](https://github.com/jlopez/grove/issues/37)). Both showed
+  the full unified diff of each synced path — into a terminal that may be
+  screen-shared, logged, or read into an agent transcript (which is how two live
+  tokens ended up in one the night the feature merged). Both are now **masked
+  by default**: a dotenv file is reported per key (`KEY: only in main` /
+  `only in worktree` / `differs (main N chars, worktree M chars)`, and `empty in
+  main, worktree N chars ('grove sync' fills it)` for a placeholder), a
+  directory per entry, and anything else as the stripped diff with every
+  `-`/`+` line replaced by its length (`- [21 chars]`) and the context lines
+  dropped — a neighbour both sides agree on is still a secret. Hunk headers stay
+  stripped of git's function context either way. `--unmask` on `grove sync
+  check` and `grove rm` prints the real colored diff; `grove rm --force
+  --unmask` shows it and removes.
+- **An unreadable synced file read as "differs", not "could not compare".** git
+  reports an unreadable side of `diff --no-index` as a plain difference (exit
+  1), so the guard's fail-closed branch never fired for it, and the dotenv
+  parser then spewed `Permission denied`. `grove_sync_differs` checks
+  readability itself now and fails closed. Found because 13 sync tests re-ran
+  `set +eu` *after* sourcing grove (which re-enables errexit), leaving only
+  their last line asserted; they assert every line again.
 - **`sync.paths` assumed the main checkout was the origin of every synced path**
   ([#34](https://github.com/jlopez/grove/issues/34)). A path is naturally *born*
   on the branch that introduces it, so `grove sync add 260916-book-club/.env`
@@ -71,8 +106,8 @@ All notable changes to grove are documented here. Format follows
   untouched on both sides and `grove sync` exits **1** — after processing every
   other path — reporting `KEY: differs (main 9 chars, worktree 3 chars)`: the
   keys, **never the values**, so a sync on a screen-shared or logged terminal
-  can't spray a `.env` across it. `grove sync check` still shows the full diff
-  when you ask for it. Anything that
+  can't spray a `.env` across it. `grove sync check --unmask` still shows the
+  full diff when you ask for it. Anything that
   isn't dotenv-shaped (multi-line values, JSON, a symlink, any NUL byte) keeps
   the old behaviour: warn and point at `grove sync check`. Consequently the
   teardown guard treats two dotenv files with the same keys and values as in
