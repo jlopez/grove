@@ -128,8 +128,10 @@ this worktree. Nothing is ever overwritten — only which side may be the source
 both sides have a `.env` and they differ, the **keys are merged**: whatever only one side has
 is appended verbatim to the other (each file keeps its own order, comments and quoting), and
 `KEY=foo` / `KEY="foo"` count as the same value. A key both sides define *differently* is a
-conflict — that path is left alone, its diff is printed, and `grove sync` exits 1 after
-processing the rest. Files that aren't dotenv-shaped keep the old behaviour: they're reported,
+conflict — that path is left alone and `grove sync` exits 1 after processing the rest,
+reporting `TOKEN: differs (main 41 chars, worktree 4 chars)`: **the keys, never the values**,
+so syncing on a shared screen can't spray your `.env` across it. `grove sync check` still
+shows the full diff when you ask for it. Files that aren't dotenv-shaped keep the old behaviour: they're reported,
 not touched.
 
 Look at it, decide you don't care, `grove rm -f`. The check is stateless — it compares

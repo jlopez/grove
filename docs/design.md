@@ -489,8 +489,12 @@ that one function, so the two commands cannot disagree about the same file.
 
 The rendering is separate from the verdict, and only runs once divergence is already decided.
 git's file headers are stripped — they carry absolute paths and the line above already names
-the file — by matching each line against a **color-stripped copy** of itself in `awk`, so the
-printed line keeps its ANSI attributes. Three cases get special handling: a **directory**
+the file — and so is the **function context** git appends to every `@@` hunk header: the
+nearest preceding line that looks like a definition, which in a `.env` is *the line above the
+change*, i.e. a neighbouring secret pasted verbatim onto a header that gets quoted into
+summaries and chat. Line numbers stay, the rest goes. The stripping is done by matching each
+line against a **color-stripped copy** of itself in `awk`, so the printed line keeps its ANSI
+attributes. Three cases get special handling: a **directory**
 `sync.path` spans many files, so there the `+++` line is rewritten to a short relative label
 instead of dropped (anonymous hunks are useless to act on); a **mode-only** change produces a
 diff with no hunks at all, so `old mode`/`new mode` become `mode changed 100644 -> 100755`
@@ -570,9 +574,17 @@ Values are compared **normalized** — surrounding whitespace dropped, one layer
 quotes stripped — because `KEY=foo`, `KEY="foo"` and `KEY='foo'` are the same value, and
 quoting style is precisely the difference two hands introduce independently. A key both sides
 define with genuinely different values is a **conflict**: that path is left untouched on both
-sides (a half-merged `.env` is worse than an unmerged one), the conflicting key names and the
-diff are printed, and `grove sync` exits **1** — after processing every other path, because a
-conflict in one secret must not strand the other four.
+sides (a half-merged `.env` is worse than an unmerged one), and `grove sync` exits **1** —
+after processing every other path, because a conflict in one secret must not strand the other
+four.
+
+**A conflict report names keys and prints no values.** Not the conflicting ones, and not — via
+a diff's context lines — the neighbours that agree. `KEY: differs (main 9 chars, worktree 3
+chars)` is enough to tell "mine is the long one" from a typo and to go reconcile it by hand,
+and a `grove sync` that someone runs on a screen-shared or logged terminal should not be the
+thing that sprays a `.env` across it. The full diff is still one command away
+(`grove sync check`), which is the right shape: seeing secrets should be an explicit choice,
+not a side effect of syncing.
 
 ### `grove sync` — the verb
 

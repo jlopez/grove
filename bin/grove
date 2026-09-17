@@ -328,11 +328,13 @@ grove_dotenv_append() {
 # and the names land in GROVE_DOTENV_CONFLICTS.
 # Exit: 0 merged, 1 conflict, 2 one side isn't dotenv-shaped.
 GROVE_DOTENV_CONFLICTS=()
+GROVE_DOTENV_CONFLICT_LEN_A=()
+GROVE_DOTENV_CONFLICT_LEN_B=()
 grove_dotenv_merge() {
   local a="$1" b="$2" k
   local a_keys=() b_keys=() add_a=() add_b=()
   local -A a_val=() a_line=() b_val=() b_line=()
-  GROVE_DOTENV_CONFLICTS=()
+  GROVE_DOTENV_CONFLICTS=(); GROVE_DOTENV_CONFLICT_LEN_A=(); GROVE_DOTENV_CONFLICT_LEN_B=()
   grove_dotenv_scan "$a" || return 2
   a_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
@@ -345,7 +347,12 @@ grove_dotenv_merge() {
   done
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
     [ -n "${b_val[$k]+x}" ] || continue
-    [ "${a_val[$k]}" = "${b_val[$k]}" ] || GROVE_DOTENV_CONFLICTS+=("$k")
+    [ "${a_val[$k]}" = "${b_val[$k]}" ] && continue
+    # Lengths, not values: enough to tell "mine is the long one" apart from a
+    # typo, without putting either secret on screen. See grove_sync_unit.
+    GROVE_DOTENV_CONFLICTS+=("$k")
+    GROVE_DOTENV_CONFLICT_LEN_A+=("${#a_val[$k]}")
+    GROVE_DOTENV_CONFLICT_LEN_B+=("${#b_val[$k]}")
   done
   [ ${#GROVE_DOTENV_CONFLICTS[@]} -eq 0 ] || return 1
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
@@ -496,6 +503,16 @@ grove_sync_diff_body() {
     function plain(s) { gsub(e "\\[[0-9;]*m", "", s); return s }
     {
       l = plain($0)
+      if (l ~ /^@@ /) {
+        # git appends "function context" to a hunk header: the nearest preceding
+        # line that looks like a definition. In a .env that is *the line above the
+        # change* — i.e. a neighbouring secret, printed verbatim into a terminal
+        # that may be screen-shared or logged. Keep the line numbers, drop the rest.
+        hdr = l
+        if (match(hdr, /^@@[^@]*@@/)) hdr = substr(hdr, RSTART, RLENGTH)
+        if (index($0, e) > 0) print e "[36m" hdr e "[m"; else print hdr
+        next
+      }
       if (l ~ /^Binary files /) {
         name = l; sub(/^Binary files .* and b/, "", name); sub(/ differ$/, "", name)
         idx = index(name, dp); if (idx) name = substr(name, idx + length(dp))
@@ -593,7 +610,7 @@ grove_sync_take() {
 # it needs. Recurses into a directory present on both sides. Appends to the
 # report arrays above; never fatal.
 grove_sync_unit() {
-  local main="$1" wt="$2" p="$3" rc=0 mrc=0 e entries=()
+  local main="$1" wt="$2" p="$3" rc=0 mrc=0 e i entries=()
   local in_main=0 in_wt=0
   local -A seen_entry=()
   if [ -e "$main/$p" ] || [ -L "$main/$p" ]; then in_main=1; fi
@@ -626,9 +643,19 @@ grove_sync_unit() {
   case "$mrc" in
     0) GROVE_SYNC_MERGED+=("$p") ;;
     1) GROVE_SYNC_CONFLICTED+=("$p")
-       warn "sync: ${_c_bld}$p${_c_rst} sets these keys differently on the two sides (skipped): ${GROVE_DOTENV_CONFLICTS[*]}"
-       warn "sync: ${_c_bld}$p${_c_rst} (- main, + worktree):"
-       grove_sync_show_diff "$main/$p" "$wt/$p" ;;
+       # Deliberately *not* the diff. A conflict in a .env is about keys, and the
+       # keys are all you need to go reconcile it by hand; printing the two values
+       # would spray secrets — the conflicting one and, through git's context
+       # lines, the neighbours that agree — into a terminal that may be
+       # screen-shared or logged. `grove sync check` still shows the full diff
+       # when you ask for it, which is the right place for an explicit choice.
+       warn "sync: ${_c_bld}$p${_c_rst} sets these keys differently on the two sides (skipped):"
+       for i in "${!GROVE_DOTENV_CONFLICTS[@]}"; do
+         printf '    %s%s%s: differs (main %s chars, worktree %s chars)\n' \
+           "$_c_bld" "${GROVE_DOTENV_CONFLICTS[$i]}" "$_c_rst" \
+           "${GROVE_DOTENV_CONFLICT_LEN_A[$i]}" "${GROVE_DOTENV_CONFLICT_LEN_B[$i]}" >&2
+       done
+       warn "sync: values are not printed — 'grove sync check' shows the full diff" ;;
     *) GROVE_SYNC_DIVERGED+=("$p") ;;
   esac
   return 0

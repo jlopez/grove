@@ -68,13 +68,23 @@ All notable changes to grove are documented here. Format follows
   and quoting, and nothing already written is rewritten. Values compare
   normalized, so `KEY=foo`, `KEY="foo"` and `KEY='foo'` are not a conflict. A key
   both sides define with genuinely different values *is*: that path is left
-  untouched on both sides, its conflicting keys and diff are printed, and
-  `grove sync` exits **1** — after processing every other path. Anything that
+  untouched on both sides and `grove sync` exits **1** — after processing every
+  other path — reporting `KEY: differs (main 9 chars, worktree 3 chars)`: the
+  keys, **never the values**, so a sync on a screen-shared or logged terminal
+  can't spray a `.env` across it. `grove sync check` still shows the full diff
+  when you ask for it. Anything that
   isn't dotenv-shaped (multi-line values, JSON, a symlink, any NUL byte) keeps
   the old behaviour: warn and point at `grove sync check`. Consequently the
   teardown guard treats two dotenv files with the same keys and values as in
   sync, so `grove rm` passes after a merge; the knowing cost is a comment that
   exists only in the worktree no longer stopping the removal.
+- **The sync diff leaked a neighbouring secret through the hunk header.** git
+  appends "function context" to every `@@` line — the nearest preceding line that
+  looks like a definition, which in a `.env` is *the line above the change*. So
+  `grove sync check` (and `grove rm`'s refusal) printed
+  `@@ -4,5 +4,5 @@ ABS_TOKEN=eyJhbGciOi…`, pasting an unrelated secret onto the
+  one line most likely to be quoted into a summary or chat. Hunk headers now keep
+  their line numbers and drop everything after the second `@@`.
 - **The teardown guard decided divergence from whether a diff *printed*, not from
   git's exit status** — so `grove rm` deleted the worktree in three reachable
   cases where `git diff --no-index` reports a difference while emitting nothing:

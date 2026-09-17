@@ -1434,7 +1434,7 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [ "$status" -eq 0 ]
 }
 
-@test "sync_exchange: the same key with two values is a conflict — exit 1, diff, nothing written" {
+@test "sync_exchange: the same key with two values is a conflict — exit 1, nothing written" {
   set +eu
   source "$GROVE"
   _pair_fixture
@@ -1443,11 +1443,47 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   run grove_sync_exchange "$SRC" "$DST"
   [ "$status" -eq 1 ]
   [[ "$output" == *"sets these keys differently"* ]]
-  [[ "$output" == *"A"* ]]
-  [[ "$output" == *"-A=1"* ]]            # the diff is printed
-  [[ "$output" == *"+A=2"* ]]
+  [[ "$output" == *"A: differs (main 1 chars, worktree 1 chars)"* ]]
+  [[ "$output" == *"values are not printed"* ]]
   [ "$(cat "$SRC/.env")" = "$(printf 'A=1\nONLY_MAIN=m')" ]   # untouched…
   [ "$(cat "$DST/.env")" = "$(printf 'A=2\nONLY_WT=w')" ]     # …on both sides
+}
+
+@test "sync_exchange: a conflict report leaks no value — not the conflicting one, not its neighbours" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  # The conflicting key sits *after* other lines, so a unified diff would carry a
+  # neighbour into the hunk header as git's "function context".
+  printf 'KEEP=shared-kept-value\nONLY_MAIN=main-only-value\nTOKEN=alphaalphaalpha\n' > "$SRC/.env"
+  printf 'KEEP=shared-kept-value\nONLY_WT=wt-only-value\nTOKEN=beta\n'                > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TOKEN: differs (main 15 chars, worktree 4 chars)"* ]]
+  [[ "$output" != *"alphaalphaalpha"* ]]     # the conflicting values
+  [[ "$output" != *"beta"* ]]
+  [[ "$output" != *"shared-kept-value"* ]]   # a line both sides agree on
+  [[ "$output" != *"main-only-value"* ]]     # a line only one side has
+  [[ "$output" != *"wt-only-value"* ]]
+  [[ "$output" != *"@@"* ]]                  # no diff at all, so no hunk header
+}
+
+@test "sync_check: a hunk header never carries git's function context (a neighbouring secret)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\nB=2\nC=3\nABS_TOKEN=neighbouring-secret\nD=4\n' > "$SRC/.env"
+  printf 'A=1\nB=2\nC=3\nABS_TOKEN=neighbouring-secret\nD=5\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"@@"* ]]                  # the header itself is still useful
+  [[ "$output" == *"-D=4"* ]]                # the change is still shown
+  [[ "$output" == *"+D=5"* ]]
+  # The context line is legitimately in the body (git's 3 lines of context), but
+  # it must not ALSO be pasted onto the @@ header, which is what git does by
+  # default and what made it leak into one-line summaries.
+  [ "$(printf '%s\n' "$output" | grep -c 'neighbouring-secret')" -eq 1 ]
+  [[ "$(printf '%s\n' "$output" | grep '@@')" != *"neighbouring-secret"* ]]
 }
 
 @test "sync_exchange: a conflicting path doesn't stop the other paths" {
