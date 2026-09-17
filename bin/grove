@@ -547,9 +547,10 @@ grove_sync_entries() {
   local d
   for d in "$1" "$2"; do
     [ -d "$d" ] || continue
-    ( cd "$d" 2>/dev/null && find . -mindepth 1 \( -type f -o -type l \) -print ) 2>/dev/null \
-      | sed 's|^\./||'
-  done | awk '!seen[$0]++'
+    # NUL-delimited: a filename may legally contain a newline, and a line-based
+    # read would turn one entry into two bogus ones.
+    ( cd "$d" 2>/dev/null && find . -mindepth 1 \( -type f -o -type l \) -print0 ) 2>/dev/null
+  done
 }
 
 # grove_sync_take <src-root> <dst-root> <path> <to_wt|to_main> — copy one missing
@@ -559,7 +560,11 @@ grove_sync_entries() {
 # the two are on different branches.
 grove_sync_take() {
   local src="$1" dst="$2" p="$3" bucket="$4"
-  if [ -n "$(git -C "$src" ls-files -- "$p" 2>/dev/null)" ]; then
+  if [ -n "$(git -C "$src" ls-files -- "$p" 2>/dev/null)" ] \
+     || [ -n "$(git -C "$dst" ls-files -- "$p" 2>/dev/null)" ]; then
+    # Tracked on *either* side. The receiving side matters too: a path git tracks
+    # there but that is currently missing from the working tree reads as a gap,
+    # and filling it would silently resurrect a file git is managing.
     GROVE_SYNC_TRACKED+=("$p"); return 0
   fi
   if ! git -C "$src" check-ignore -q -- "$p" 2>/dev/null \
@@ -590,6 +595,7 @@ grove_sync_take() {
 grove_sync_unit() {
   local main="$1" wt="$2" p="$3" rc=0 mrc=0 e entries=()
   local in_main=0 in_wt=0
+  local -A seen_entry=()
   if [ -e "$main/$p" ] || [ -L "$main/$p" ]; then in_main=1; fi
   if [ -e "$wt/$p" ]   || [ -L "$wt/$p" ];   then in_wt=1;   fi
 
@@ -599,8 +605,12 @@ grove_sync_unit() {
 
   # Both sides present. A directory on both sides is a bag of entries, not a unit.
   if [ -d "$main/$p" ] && [ -d "$wt/$p" ] && [ ! -L "$main/$p" ] && [ ! -L "$wt/$p" ]; then
-    while IFS= read -r e; do
-      [ -n "$e" ] && entries+=("$p/$e")
+    while IFS= read -r -d '' e; do
+      e=${e#./}
+      [ -n "$e" ] || continue
+      [ -n "${seen_entry[$e]+x}" ] && continue
+      seen_entry["$e"]=1
+      entries+=("$p/$e")
     done < <(grove_sync_entries "$main/$p" "$wt/$p")
     for e in ${entries[@]+"${entries[@]}"}; do grove_sync_unit "$main" "$wt" "$e"; done
     return 0

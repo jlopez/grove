@@ -1643,3 +1643,32 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [ "$status" -eq 1 ]
   [[ "$output" == *"sync incomplete"* ]]
 }
+
+@test "sync_exchange: a directory entry whose name contains a newline is one entry" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths "cfg"
+  mkdir -p "$SRC/cfg" "$DST/cfg"
+  printf 'x\n' > "$SRC/cfg/$(printf 'we\nird')"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DST/cfg/$(printf 'we\nird')")" = "x" ]
+  [[ "$output" != *"present in neither"* ]]     # no phantom half-entries
+}
+
+@test "sync_exchange: a path git tracks on the receiving side is never resurrected" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths ".env"
+  printf 'TRACKED=1\n' > "$SRC/.env"
+  git -C "$SRC" add -f .env
+  git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm env
+  rm -f "$SRC/.env"                              # tracked in main, absent on disk
+  printf 'MINE=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tracked by git"* ]]
+  [ ! -e "$SRC/.env" ]
+}
