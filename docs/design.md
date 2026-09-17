@@ -111,7 +111,8 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    grove's own invariant (anchor = main-checkout header); the **anchor guard** in step 6 covers
    groups where that invariant doesn't hold (issue #22).
 3. **Synced-path guard** (`sync.paths`) — refuse the teardown while any synced untracked path
-   differs from the main checkout, printing a colored `git diff` per path. This is the half of
+   differs from the main checkout, reporting per path *what* differs (keys and lengths, never
+   values; `--unmask` for the real diff). This is the half of
    the feature that can't live in worktrunk: `.env` is gitignored, so `wt remove`'s dirty-tree
    refusal is structurally blind to it, and deleting the worktree would take an edited secret
    with it silently. See [Synced untracked paths](#synced-untracked-paths--syncpaths).
@@ -464,8 +465,27 @@ narrower question. Comparing against the **main checkout** needs no state at all
 "false positive" — main rotated its `.env` after the copy — is information you want before
 deleting the only other copy.
 
-Divergence is reported as a **colored `git diff --no-index`** per path, so the decision
-("I don't care about that one line") can be made without leaving the terminal:
+Divergence is reported per path so the decision ("I don't care about that one line") can be
+made without leaving the terminal — and **masked by default** (issue #37): `sync.paths` exist
+to carry secrets, so a diff of them *is* the secrets, printed into a terminal that may be
+screen-shared, logged, or — as happened the night #35 merged — read into a Claude transcript,
+which cost two token rotations. The default report says what differs, never what it is:
+
+```
+grove: sync: .env differs from the main checkout (values masked — --unmask shows them):
+    PORT: differs (main 4 chars, worktree 4 chars)
+    EXTRA: only in worktree
+    DEEPINFRA_API_KEY: empty in main, worktree 32 chars ('grove sync' fills it)
+```
+
+Three shapes, chosen per pair. Two **dotenv** files get one line per key — the shape the
+`grove sync` conflict report already used — and the placeholder case names its remedy. A
+**directory** is walked per entry (`only in main` / `only in worktree`, recursing into entries
+that differ), the same per-entry view `grove sync` takes of it. Anything else gets the
+stripped diff with every `-`/`+` line replaced by its byte length (`- [21 bytes]`) and the
+**context lines dropped** — a neighbour both sides agree on is still a secret; the `@@`
+headers stay, as the only thing left to act on. `--unmask` (on `grove sync check` and
+`grove rm`) prints the real colored `git diff --no-index` instead:
 
 ```
 grove: sync: .env differs from the main checkout (- main, + worktree):
@@ -476,6 +496,9 @@ grove: sync: .env differs from the main checkout (- main, + worktree):
 +EXTRA=yes
 ```
 
+Masking is a *display* decision layered over an unchanged verdict; nothing below this
+paragraph changes with it. Why not mask `grove sync list` too: it never printed content.
+
 **Divergence is decided by git's exit status, never by whether a diff printed.** This is the
 single most important line in the feature. `git diff --no-index` reports a difference while
 printing *nothing* in at least three reachable cases: a file↔directory type change (exit 1,
@@ -485,10 +508,13 @@ would hand each of those to `wt remove`. `grove_sync_differs` returns 0/1/2 (sam
 **could not compare**), and 2 fails closed with its own message — "I couldn't tell" must never
 render as "they match". `--no-textconv` for the same reason: a redacting diff driver must not
 be able to blind the guard protecting the file. `grove_sync_check` and `grove_sync_list` share
-that one function, so the two commands cannot disagree about the same file.
+that one function, so the two commands cannot disagree about the same file. One correction
+found while fixing #37: git reports an **unreadable** side as a plain difference (exit 1), not
+as an error, so "differs" was what `--force` would have acted on; `grove_sync_differs` now asks
+the filesystem for readability first and returns 2 itself.
 
-The rendering is separate from the verdict, and only runs once divergence is already decided.
-git's file headers are stripped — they carry absolute paths and the line above already names
+The unmasked rendering is separate from the verdict, and only runs once divergence is already
+decided. git's file headers are stripped — they carry absolute paths and the line above already names
 the file — and so is the **function context** git appends to every `@@` hunk header: the
 nearest preceding line that looks like a definition, which in a `.env` is *the line above the
 change*, i.e. a neighbouring secret pasted verbatim onto a header that gets quoted into
@@ -519,7 +545,8 @@ teaches people to reach for `--force`, which costs far more than a comment.
 
 `--force` doesn't silence the finding, it downgrades it to a one-line warning per path. The
 removal really is discarding content that exists nowhere else; that deserves a line in the
-scrollback even when it was the intent.
+scrollback even when it was the intent. `--force --unmask` shows the full diff and removes:
+asking to see the values is the stronger signal, so it wins over quiet mode.
 
 ### Both directions (`grove_sync_exchange`) — issue #34
 
@@ -571,20 +598,33 @@ and it falls back to the old behaviour: warn, point at `grove sync check`. The m
 convenience for a shape it recognizes, never a guess about a file it doesn't.
 
 Values are compared **normalized** — surrounding whitespace dropped, one layer of matching
-quotes stripped — because `KEY=foo`, `KEY="foo"` and `KEY='foo'` are the same value, and
-quoting style is precisely the difference two hands introduce independently. A key both sides
-define with genuinely different values is a **conflict**: that path is left untouched on both
-sides (a half-merged `.env` is worse than an unmerged one), and `grove sync` exits **1** —
-after processing every other path, because a conflict in one secret must not strand the other
-four.
+quotes stripped, an unquoted trailing ` # comment` dropped (bash and python-dotenv semantics;
+`a#b` stays `a#b`) — because `KEY=foo`, `KEY="foo"`, `KEY='foo'` and `KEY=foo # prod` are the
+same value, and quoting style is precisely the difference two hands introduce independently.
+
+**An empty placeholder is not a value** (issue #36). `.env.example` ships `DEEPINFRA_API_KEY=`,
+the main checkout inherits the empty line, the real key gets pasted into whichever checkout
+needed it first — and the first `grove sync` after #35 called that `differs (main 0 chars,
+worktree 32 chars)` and refused. Empty (`KEY=`, `KEY=""`, `KEY=''`, `KEY= # paste here`) on
+one side and set on the other is the placeholder being **filled**, in either direction: the
+empty side's line is replaced **in place** by the other side's — same position, the comment
+above it kept, a placeholder written `export KEY=` keeps its `export`, a CRLF line stays CRLF.
+This is the one exception to "nothing already written is rewritten", and it is a narrow one:
+the line being replaced carries no information. Empty on both sides is nothing to fill and no
+conflict. The report names the keys that were filled, never the value that travelled.
+
+A key both sides define with genuinely different **non-empty** values is a **conflict**: that
+path is left untouched on both sides — not even the fills are written, a half-merged `.env` is
+worse than an unmerged one — and `grove sync` exits **1**, after processing every other path,
+because a conflict in one secret must not strand the other four.
 
 **A conflict report names keys and prints no values.** Not the conflicting ones, and not — via
 a diff's context lines — the neighbours that agree. `KEY: differs (main 9 chars, worktree 3
 chars)` is enough to tell "mine is the long one" from a typo and to go reconcile it by hand,
 and a `grove sync` that someone runs on a screen-shared or logged terminal should not be the
 thing that sprays a `.env` across it. The full diff is still one command away
-(`grove sync check`), which is the right shape: seeing secrets should be an explicit choice,
-not a side effect of syncing.
+(`grove sync check --unmask`), which is the right shape: seeing secrets should be an explicit
+choice, not a side effect of syncing — or, since #37, of checking.
 
 ### `grove sync` — the verb
 
@@ -595,7 +635,7 @@ exposed directly:
 
 ```
 grove sync                    # fill the gaps both ways; merge dotenv keys (exit 1 on conflict)
-grove sync check              # diff vs the main checkout (rm's step 3); exit 1 if any differ
+grove sync check [--unmask]   # compare vs the main checkout (rm's step 3); exit 1 if any differ
 grove sync list               # each path's config + worktree state
 grove sync add [--local] <p>… # edit .grove.json / .grove.local.json
 grove sync rm  [--local] <p>…
