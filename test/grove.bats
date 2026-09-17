@@ -1708,3 +1708,93 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [[ "$output" == *"tracked by git"* ]]
   [ ! -e "$SRC/.env" ]
 }
+
+# ---- empty placeholders (#36) -----------------------------------------------
+
+@test "sync_exchange: an empty placeholder in main is filled from the worktree (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf '# keys\nA=1\nDEEPINFRA_API_KEY=\nB=2\n' > "$SRC/.env"
+  printf 'A=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"filled empty placeholders in the main checkout"* ]]
+  [[ "$output" == *"DEEPINFRA_API_KEY (.env)"* ]]
+  [[ "$output" != *"abcdefghijklmnopqrstuvwxyz012345"* ]]     # the value travelled, it wasn't printed
+  [[ "$output" != *"differs"* ]]
+  # Filled in place: same position, the comment above it kept, nothing appended.
+  [ "$(cat "$SRC/.env")" = "$(printf '# keys\nA=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2')" ]
+  [ "$(cat "$DST/.env")" = "$(printf 'A=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2')" ]
+  run grove_sync_check "$SRC" "$DST"                            # and the guard now passes
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_exchange: an empty placeholder in the worktree is filled from main (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'TOKEN=real-token-value\n' > "$SRC/.env"
+  printf 'TOKEN=\nEXTRA=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"filled empty placeholders in this worktree"* ]]
+  [[ "$output" == *"TOKEN (.env)"* ]]
+  [[ "$output" != *"real-token-value"* ]]
+  [ "$(cat "$DST/.env")" = "$(printf 'TOKEN=real-token-value\nEXTRA=1')" ]
+  [ "$(cat "$SRC/.env")" = "$(printf 'TOKEN=real-token-value\nEXTRA=1')" ]   # the disjoint key still merged
+}
+
+@test "sync_exchange: a quotes-only placeholder (\"\" / '') is empty too (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=""\nB='"''"'\n' > "$SRC/.env"
+  printf 'A=aaa\nB=bbb\n'   > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SRC/.env")" = "$(printf 'A=aaa\nB=bbb')" ]
+}
+
+@test "sync_exchange: two different non-empty values are still a conflict (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=one\nP=\n' > "$SRC/.env"
+  printf 'A=two\nP=filled\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"A: differs (main 3 chars, worktree 3 chars)"* ]]
+  [[ "$output" != *"filled empty placeholders"* ]]
+  [ "$(cat "$SRC/.env")" = "$(printf 'A=one\nP=')" ]          # a conflict writes nothing, not even the fill
+  [ "$(cat "$DST/.env")" = "$(printf 'A=two\nP=filled')" ]
+}
+
+@test "dotenv_merge: placeholder edge cases — export kept, CRLF kept, both-empty untouched, trailing comment is not a value" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/pa" b="$BATS_TEST_TMPDIR/pb"
+  printf 'export E=\nQ=\r\nBOTH=\nC= # paste here\n' > "$a"
+  printf 'E="ee"\nQ=qq\nBOTH=""\nC=cval\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  [ "$(sed -n 1p "$a")" = 'export E="ee"' ]         # the placeholder's export prefix survives
+  [ "$(sed -n 2p "$a" | tr -d '\r')" = 'Q=qq' ]
+  [[ "$(sed -n 2p "$a")" == *$'\r' ]]                # a CRLF line stays CRLF
+  [ "$(sed -n 3p "$a")" = 'BOTH=' ]                  # empty on both sides: nothing to fill, no conflict
+  [ "$(sed -n 4p "$a")" = 'C=cval' ]                 # `KEY= # comment` was a placeholder, not a 10-char value
+  [ "${GROVE_DOTENV_FILLED_A[*]}" = "E Q C" ]
+  [ "${#GROVE_DOTENV_FILLED_B[@]}" -eq 0 ]
+  [ "$(wc -l < "$a")" -eq 4 ]                        # nothing appended
+}
+
+@test "dotenv_norm: an unquoted trailing comment is dropped, a quoted # is kept" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_dotenv_norm 'foo # note')" = "foo" ]
+  [ "$(grove_dotenv_norm '# only')" = "" ]
+  [ "$(grove_dotenv_norm 'a#b')" = "a#b" ]           # no whitespace before it: part of the value
+  [ "$(grove_dotenv_norm '"a # b"')" = "a # b" ]
+  [ "$(grove_dotenv_norm '"a" # b')" = "a" ]
+  [ "$(grove_dotenv_norm '"a"b')" = '"a"b' ]         # not a clean quote pair: kept whole
+  [ "$(grove_dotenv_norm "''")" = "" ]
+}

@@ -243,19 +243,39 @@ GROVE_DOTENV_KEYS=()
 if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
   declare -A GROVE_DOTENV_VAL=()
   declare -A GROVE_DOTENV_LINE=()
+  declare -A GROVE_DOTENV_LINENO=()
 fi
 
 # grove_dotenv_norm <raw-value> — the value as a loader would see it: surrounding
-# whitespace dropped, one layer of matching quotes stripped. So `KEY=foo`,
-# `KEY="foo"` and `KEY='foo'` are the same value and not a conflict — quoting
-# style is exactly the kind of difference two hands introduce independently.
+# whitespace dropped, one layer of matching quotes stripped, and a trailing
+# ` # comment` dropped from an unquoted value. So `KEY=foo`, `KEY="foo"`,
+# `KEY='foo'` and `KEY=foo # prod` are the same value and not a conflict —
+# quoting style is exactly the kind of difference two hands introduce
+# independently. The comment rule follows bash and python-dotenv (`#` after
+# whitespace, or as the whole value); `a#b` stays `a#b`. It is what makes
+# `KEY= # paste it here` an *empty* placeholder (#36) rather than a 17-char
+# value that conflicts with the real key.
 grove_dotenv_norm() {
-  local v="$1"
+  local v="$1" q rest inner
   v="${v#"${v%%[![:space:]]*}"}"                 # ltrim
   v="${v%"${v##*[![:space:]]}"}"                 # rtrim
   case "$v" in
-    '"'*'"') v=${v:1:${#v}-2} ;;
-    "'"*"'") v=${v:1:${#v}-2} ;;
+    '"'*|"'"*)
+      # Quoted: the value is what sits between the opening quote and the first
+      # closing one, provided nothing but a comment follows — `"a # b"` keeps
+      # its `#`, `"a" # b` drops the comment. Anything stranger (`"a"b`, a lone
+      # quote) is kept whole, as before: a guess would be worse than a mismatch.
+      q=${v:0:1}; rest=${v:1}
+      if [[ "$rest" == *"$q"* ]]; then
+        inner=${rest%%"$q"*}
+        rest=${rest#*"$q"}
+        if [[ "$rest" =~ ^[[:space:]]*(#.*)?$ ]]; then v=$inner; fi
+      fi ;;
+    '#'*) v="" ;;                                # the whole value is a comment
+    *)
+      v=${v%%[[:space:]]#*}                      # `foo # note` → `foo`
+      v="${v%"${v##*[![:space:]]}"}"             # rtrim again
+      ;;
   esac
   printf '%s' "$v"
 }
@@ -263,17 +283,20 @@ grove_dotenv_norm() {
 # grove_dotenv_scan <file> — parse <file> into GROVE_DOTENV_KEYS (first-seen
 # order), GROVE_DOTENV_VAL[key] (normalized) and GROVE_DOTENV_LINE[key] (the
 # verbatim source line, so a merge carries the author's own quoting and `export`
-# prefix across rather than re-rendering it). Returns 1 unless *every* line is
-# blank, a comment or an assignment — a partial parse would merge half a file.
+# prefix across rather than re-rendering it) and GROVE_DOTENV_LINENO[key] (its
+# 1-based line number, so a placeholder fill can replace *that* line and no
+# other). Returns 1 unless *every* line is blank, a comment or an assignment —
+# a partial parse would merge half a file.
 grove_dotenv_scan() {
-  local f="$1" line key
-  GROVE_DOTENV_KEYS=(); GROVE_DOTENV_VAL=(); GROVE_DOTENV_LINE=()
+  local f="$1" line key n=0
+  GROVE_DOTENV_KEYS=(); GROVE_DOTENV_VAL=(); GROVE_DOTENV_LINE=(); GROVE_DOTENV_LINENO=()
   [ -L "$f" ] && return 1        # a symlinked .env is a deliberate shared file
   [ -f "$f" ] || return 1
   # NUL means binary, and `read` would silently swallow it — reject outright
   # rather than "parse" a file whose bytes we never saw.
   [ -z "$(LC_ALL=C tr -dc '\000' < "$f" | tr '\000' 'x')" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
     line=${line%$'\r'}                                        # CRLF
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
     if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
@@ -281,6 +304,7 @@ grove_dotenv_scan() {
       [ -n "${GROVE_DOTENV_VAL[$key]+x}" ] || GROVE_DOTENV_KEYS+=("$key")
       GROVE_DOTENV_VAL["$key"]=$(grove_dotenv_norm "${BASH_REMATCH[3]}")
       GROVE_DOTENV_LINE["$key"]="$line"
+      GROVE_DOTENV_LINENO["$key"]="$n"
     else
       return 1
     fi
@@ -320,47 +344,107 @@ grove_dotenv_append() {
   printf '%s\n' "$@" >> "$f"
 }
 
+# grove_dotenv_replace <file> <lineno> <line> [<lineno> <line>...] — replace
+# the given 1-based lines of <file> in place, keeping every other byte (a CRLF
+# line stays CRLF). Truncate-and-rewrite on the same inode, so the file's mode
+# (`.env` is often 600) and any hard link survive.
+grove_dotenv_replace() {
+  local f="$1" i; shift
+  local -A repl=()
+  while [ $# -ge 2 ]; do repl["$1"]="$2"; shift 2; done
+  local lines=()
+  mapfile -t lines < "$f"
+  for i in "${!lines[@]}"; do
+    [ -n "${repl[$((i + 1))]+x}" ] || continue
+    if [[ "${lines[$i]}" == *$'\r' ]]; then lines[i]="${repl[$((i + 1))]}"$'\r'
+    else lines[i]="${repl[$((i + 1))]}"; fi
+  done
+  printf '%s\n' "${lines[@]}" > "$f"
+}
+
+# grove_dotenv_fill_line <placeholder-line> <donor-line> — the line that
+# replaces an empty placeholder: the donor's, verbatim (its quoting is the
+# author's), except that a placeholder written `export KEY=` keeps its `export`
+# — a file that is `source`d relies on it, and the donor may not have needed it.
+grove_dotenv_fill_line() {
+  local ph="$1" donor="$2"
+  if [[ "$ph" =~ ^[[:space:]]*export[[:space:]] ]] \
+     && ! [[ "$donor" =~ ^[[:space:]]*export[[:space:]] ]]; then
+    donor="${donor#"${donor%%[![:space:]]*}"}"
+    printf 'export %s' "$donor"
+  else
+    printf '%s' "$donor"
+  fi
+}
+
 # grove_dotenv_merge <a> <b> — union the key sets of two dotenv files *in place*.
 # Keys only in <a> are appended to <b> and vice versa, verbatim, so each file
 # keeps its own order, comments and quoting — a merge never rewrites a line
-# someone wrote. A key both sides define with different values is a conflict:
-# nothing is written at all (a half-merged .env is worse than an unmerged one)
-# and the names land in GROVE_DOTENV_CONFLICTS.
+# someone wrote, with one exception: an **empty placeholder**. `.env.example`
+# ships `KEY=` (or `KEY=""`), the copy inherits it, and the real value gets
+# pasted into whichever checkout needed it first. Empty on one side and set on
+# the other is that placeholder being filled, not a disagreement (#36), so the
+# empty side's line is replaced by the other side's — in place, so the key keeps
+# its position and its neighbouring comment. Only two *different non-empty*
+# values are a conflict: then nothing is written at all (a half-merged .env is
+# worse than an unmerged one) and the names land in GROVE_DOTENV_CONFLICTS.
+# Filled keys land in GROVE_DOTENV_FILLED_A / _B (the side that *received*).
 # Exit: 0 merged, 1 conflict, 2 one side isn't dotenv-shaped.
 GROVE_DOTENV_CONFLICTS=()
 GROVE_DOTENV_CONFLICT_LEN_A=()
 GROVE_DOTENV_CONFLICT_LEN_B=()
+GROVE_DOTENV_FILLED_A=()
+GROVE_DOTENV_FILLED_B=()
 grove_dotenv_merge() {
   local a="$1" b="$2" k
-  local a_keys=() b_keys=() add_a=() add_b=()
-  local -A a_val=() a_line=() b_val=() b_line=()
+  local a_keys=() b_keys=() add_a=() add_b=() fill_a=() fill_b=()
+  local -A a_val=() a_line=() a_no=() b_val=() b_line=() b_no=()
   GROVE_DOTENV_CONFLICTS=(); GROVE_DOTENV_CONFLICT_LEN_A=(); GROVE_DOTENV_CONFLICT_LEN_B=()
+  GROVE_DOTENV_FILLED_A=(); GROVE_DOTENV_FILLED_B=()
   grove_dotenv_scan "$a" || return 2
   a_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
     a_val["$k"]="${GROVE_DOTENV_VAL[$k]}"; a_line["$k"]="${GROVE_DOTENV_LINE[$k]}"
+    a_no["$k"]="${GROVE_DOTENV_LINENO[$k]}"
   done
   grove_dotenv_scan "$b" || return 2
   b_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
   for k in ${b_keys[@]+"${b_keys[@]}"}; do
     b_val["$k"]="${GROVE_DOTENV_VAL[$k]}"; b_line["$k"]="${GROVE_DOTENV_LINE[$k]}"
+    b_no["$k"]="${GROVE_DOTENV_LINENO[$k]}"
   done
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
     [ -n "${b_val[$k]+x}" ] || continue
     [ "${a_val[$k]}" = "${b_val[$k]}" ] && continue
+    # Empty vs set: a placeholder being filled. (Empty vs empty never gets
+    # here — `KEY=` and `KEY=""` both normalize to the same nothing.)
+    if [ -z "${a_val[$k]}" ]; then
+      fill_a+=("${a_no[$k]}" "$(grove_dotenv_fill_line "${a_line[$k]}" "${b_line[$k]}")")
+      GROVE_DOTENV_FILLED_A+=("$k"); continue
+    fi
+    if [ -z "${b_val[$k]}" ]; then
+      fill_b+=("${b_no[$k]}" "$(grove_dotenv_fill_line "${b_line[$k]}" "${a_line[$k]}")")
+      GROVE_DOTENV_FILLED_B+=("$k"); continue
+    fi
     # Lengths, not values: enough to tell "mine is the long one" apart from a
     # typo, without putting either secret on screen. See grove_sync_unit.
     GROVE_DOTENV_CONFLICTS+=("$k")
     GROVE_DOTENV_CONFLICT_LEN_A+=("${#a_val[$k]}")
     GROVE_DOTENV_CONFLICT_LEN_B+=("${#b_val[$k]}")
   done
-  [ ${#GROVE_DOTENV_CONFLICTS[@]} -eq 0 ] || return 1
+  if [ ${#GROVE_DOTENV_CONFLICTS[@]} -gt 0 ]; then
+    GROVE_DOTENV_FILLED_A=(); GROVE_DOTENV_FILLED_B=()   # nothing was written
+    return 1
+  fi
   for k in ${a_keys[@]+"${a_keys[@]}"}; do
     [ -n "${b_val[$k]+x}" ] || add_b+=("${a_line[$k]}")
   done
   for k in ${b_keys[@]+"${b_keys[@]}"}; do
     [ -n "${a_val[$k]+x}" ] || add_a+=("${b_line[$k]}")
   done
+  # Fills first (they address lines by number), appends after.
+  [ ${#fill_a[@]} -gt 0 ] && grove_dotenv_replace "$a" "${fill_a[@]}"
+  [ ${#fill_b[@]} -gt 0 ] && grove_dotenv_replace "$b" "${fill_b[@]}"
   grove_dotenv_append "$b" ${add_b[@]+"${add_b[@]}"}
   grove_dotenv_append "$a" ${add_a[@]+"${add_a[@]}"}
   return 0
@@ -555,6 +639,7 @@ grove_sync_diff_body() {
 GROVE_SYNC_TO_WT=(); GROVE_SYNC_TO_MAIN=(); GROVE_SYNC_MERGED=()
 GROVE_SYNC_ABSENT=(); GROVE_SYNC_TRACKED=(); GROVE_SYNC_UNIGNORED=()
 GROVE_SYNC_DIVERGED=(); GROVE_SYNC_CONFLICTED=()
+GROVE_SYNC_FILLED_MAIN=(); GROVE_SYNC_FILLED_WT=()   # "KEY (path)" per filled placeholder
 
 # grove_sync_entries <dir-a> <dir-b> — the union of file/symlink entries under
 # either directory, relative, first-seen order. A directory sync.path is handled
@@ -641,21 +726,23 @@ grove_sync_unit() {
   fi
   grove_dotenv_merge "$main/$p" "$wt/$p" || mrc=$?
   case "$mrc" in
-    0) GROVE_SYNC_MERGED+=("$p") ;;
+    0) GROVE_SYNC_MERGED+=("$p")
+       for i in ${GROVE_DOTENV_FILLED_A[@]+"${GROVE_DOTENV_FILLED_A[@]}"}; do GROVE_SYNC_FILLED_MAIN+=("$i ($p)"); done
+       for i in ${GROVE_DOTENV_FILLED_B[@]+"${GROVE_DOTENV_FILLED_B[@]}"}; do GROVE_SYNC_FILLED_WT+=("$i ($p)"); done ;;
     1) GROVE_SYNC_CONFLICTED+=("$p")
        # Deliberately *not* the diff. A conflict in a .env is about keys, and the
        # keys are all you need to go reconcile it by hand; printing the two values
        # would spray secrets — the conflicting one and, through git's context
        # lines, the neighbours that agree — into a terminal that may be
-       # screen-shared or logged. `grove sync check` still shows the full diff
-       # when you ask for it, which is the right place for an explicit choice.
+       # screen-shared or logged. `grove sync check --unmask` still shows the
+       # full diff when you ask for it — the right place for an explicit choice.
        warn "sync: ${_c_bld}$p${_c_rst} sets these keys differently on the two sides (skipped):"
        for i in "${!GROVE_DOTENV_CONFLICTS[@]}"; do
          printf '    %s%s%s: differs (main %s chars, worktree %s chars)\n' \
            "$_c_bld" "${GROVE_DOTENV_CONFLICTS[$i]}" "$_c_rst" \
            "${GROVE_DOTENV_CONFLICT_LEN_A[$i]}" "${GROVE_DOTENV_CONFLICT_LEN_B[$i]}" >&2
        done
-       warn "sync: values are not printed — 'grove sync check' shows the full diff" ;;
+       warn "sync: values are not printed — 'grove sync check --unmask' shows the full diff" ;;
     *) GROVE_SYNC_DIVERGED+=("$p") ;;
   esac
   return 0
@@ -673,6 +760,7 @@ grove_sync_exchange() {
   GROVE_SYNC_TO_WT=(); GROVE_SYNC_TO_MAIN=(); GROVE_SYNC_MERGED=()
   GROVE_SYNC_ABSENT=(); GROVE_SYNC_TRACKED=(); GROVE_SYNC_UNIGNORED=()
   GROVE_SYNC_DIVERGED=(); GROVE_SYNC_CONFLICTED=()
+  GROVE_SYNC_FILLED_MAIN=(); GROVE_SYNC_FILLED_WT=()
   [ ${#paths[@]} -gt 0 ] || return 0
   for p in "${paths[@]}"; do
     if ! grove_sync_path_ok "$p"; then
@@ -684,6 +772,9 @@ grove_sync_exchange() {
   [ ${#GROVE_SYNC_TO_WT[@]}   -gt 0 ] && info "synced from the main checkout: ${GROVE_SYNC_TO_WT[*]}"
   [ ${#GROVE_SYNC_TO_MAIN[@]} -gt 0 ] && info "seeded the main checkout from this worktree: ${GROVE_SYNC_TO_MAIN[*]}"
   [ ${#GROVE_SYNC_MERGED[@]}  -gt 0 ] && info "merged dotenv keys: ${GROVE_SYNC_MERGED[*]}"
+  # Key names only — the value just travelled, it doesn't also get printed.
+  [ ${#GROVE_SYNC_FILLED_WT[@]}   -gt 0 ] && info "filled empty placeholders in this worktree from the main checkout: ${GROVE_SYNC_FILLED_WT[*]}"
+  [ ${#GROVE_SYNC_FILLED_MAIN[@]} -gt 0 ] && info "filled empty placeholders in the main checkout from this worktree: ${GROVE_SYNC_FILLED_MAIN[*]}"
   [ ${#GROVE_SYNC_ABSENT[@]}  -gt 0 ] && warn "sync.paths present in neither checkout (skipped): ${GROVE_SYNC_ABSENT[*]}"
   [ ${#GROVE_SYNC_TRACKED[@]} -gt 0 ] && warn "sync.paths tracked by git (skipped — git already carries them): ${GROVE_SYNC_TRACKED[*]}"
   [ ${#GROVE_SYNC_UNIGNORED[@]} -gt 0 ] && warn "sync.paths not gitignored on both sides (skipped — copying would leave a checkout dirty and block 'wt remove'): ${GROVE_SYNC_UNIGNORED[*]}"
