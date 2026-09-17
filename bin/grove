@@ -656,7 +656,7 @@ grove_sync_exchange() {
   done
   [ ${#GROVE_SYNC_TO_WT[@]}   -gt 0 ] && info "synced from the main checkout: ${GROVE_SYNC_TO_WT[*]}"
   [ ${#GROVE_SYNC_TO_MAIN[@]} -gt 0 ] && info "seeded the main checkout from this worktree: ${GROVE_SYNC_TO_MAIN[*]}"
-  [ ${#GROVE_SYNC_MERGED[@]}  -gt 0 ] && info "merged dotenv keys both ways: ${GROVE_SYNC_MERGED[*]}"
+  [ ${#GROVE_SYNC_MERGED[@]}  -gt 0 ] && info "merged dotenv keys: ${GROVE_SYNC_MERGED[*]}"
   [ ${#GROVE_SYNC_ABSENT[@]}  -gt 0 ] && warn "sync.paths present in neither checkout (skipped): ${GROVE_SYNC_ABSENT[*]}"
   [ ${#GROVE_SYNC_TRACKED[@]} -gt 0 ] && warn "sync.paths tracked by git (skipped — git already carries them): ${GROVE_SYNC_TRACKED[*]}"
   [ ${#GROVE_SYNC_UNIGNORED[@]} -gt 0 ] && warn "sync.paths not gitignored on both sides (skipped — copying would leave a checkout dirty and block 'wt remove'): ${GROVE_SYNC_UNIGNORED[*]}"

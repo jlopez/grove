@@ -1423,7 +1423,7 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   printf 'B=2\nexport C=3\n' > "$DST/.env"
   run grove_sync_exchange "$SRC" "$DST"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"merged dotenv keys both ways"* ]]
+  [[ "$output" == *"merged dotenv keys"* ]]
   grep -qx 'A=1' "$DST/.env"
   grep -qx 'B=2' "$SRC/.env"
   grep -qx 'export C=3' "$SRC/.env"      # the verbatim line crosses, export and all
