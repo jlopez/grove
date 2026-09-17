@@ -291,7 +291,7 @@ grove_dotenv_scan() {
   local f="$1" line key n=0
   GROVE_DOTENV_KEYS=(); GROVE_DOTENV_VAL=(); GROVE_DOTENV_LINE=(); GROVE_DOTENV_LINENO=()
   [ -L "$f" ] && return 1        # a symlinked .env is a deliberate shared file
-  [ -f "$f" ] || return 1
+  [ -f "$f" ] && [ -r "$f" ] || return 1
   # NUL means binary, and `read` would silently swallow it — reject outright
   # rather than "parse" a file whose bytes we never saw.
   [ -z "$(LC_ALL=C tr -dc '\000' < "$f" | tr '\000' 'x')" ] || return 1
@@ -495,7 +495,13 @@ grove_sync_resolve_paths() {
 # --no-textconv for the same reason — a redacting diff driver must not be able to
 # make two different .env files look identical to the guard protecting them.
 grove_sync_differs() {
-  local rc=0
+  local rc=0 f
+  # git reports an unreadable side as a plain difference (exit 1, nothing
+  # printed), not as an error — and "differs" is the wrong answer: it lets
+  # --force delete a file nobody has looked at. Ask the filesystem first.
+  for f in "$1" "$2"; do
+    if [ -e "$f" ] && [ ! -r "$f" ]; then return 2; fi
+  done
   git --no-pager diff --no-index --no-ext-diff --no-textconv --quiet \
     -- "$1" "$2" >/dev/null 2>&1 || rc=$?
   # One narrow exception to "bytes decide": two dotenv files with the same keys
@@ -507,15 +513,21 @@ grove_sync_differs() {
   return 2                              # git errored — fail closed, never "same"
 }
 
-# grove_sync_check <src-root> <dst-root> [quiet] — compare every configured
-# sync.path in <dst-root> against <src-root>. Returns 1 if any diverged, 0
-# otherwise (including "nothing configured"). Divergence is reported on stderr
-# with a colored `git diff` per path — enough to judge "I don't care about that
-# one line" and re-run with --force; a non-empty <quiet> prints the one-line
-# summary only (the --force path, where the diff would just be noise).
+# grove_sync_check <src-root> <dst-root> [quiet] [unmask] — compare every
+# configured sync.path in <dst-root> against <src-root>. Returns 1 if any
+# diverged, 0 otherwise (including "nothing configured"). Divergence is reported
+# on stderr per path — enough to judge "I don't care about that one line" and
+# re-run with --force. By default the report is **masked** (#37): sync.paths
+# exist to carry secrets, so the diff *is* the secrets, and a terminal may be
+# screen-shared, logged, or read into a transcript. A dotenv file is reported
+# per key (`KEY: only in main` / `differs (main N chars, worktree M chars)`),
+# anything else as a diff whose lines are replaced by their lengths. A non-empty
+# <unmask> prints the real colored `git diff` instead (an explicit choice, made
+# with --unmask); a non-empty <quiet> prints the one-line summary only (the
+# --force path, where the diff would just be noise — unless --unmask asked).
 # Reads GROVE_CONFIG_JSON, so callers must grove_config_load first.
 grove_sync_check() {
-  local src="$1" dst="$2" quiet="${3:-}" p rc diverged=0
+  local src="$1" dst="$2" quiet="${3:-}" unmask="${4:-}" p rc diverged=0
   local paths=()
   paths=(${GROVE_SYNC_PATHS[@]+"${GROVE_SYNC_PATHS[@]}"})
   [ ${#paths[@]} -gt 0 ] || return 0
@@ -536,53 +548,139 @@ grove_sync_check() {
       warn "sync: ${_c_bld}$p${_c_rst} could not be compared with the main checkout — refusing to assume it matches"
       continue
     fi
-    if [ -n "$quiet" ]; then
+    if [ -n "$quiet" ] && [ -z "$unmask" ]; then
       warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout"
       continue
     fi
-    warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout (- main, + worktree):"
-    grove_sync_show_diff "$src/$p" "$dst/$p"
+    if [ -n "$unmask" ]; then
+      warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout (- main, + worktree):"
+      grove_sync_show_diff "$src/$p" "$dst/$p"
+    else
+      warn "sync: ${_c_bld}$p${_c_rst} differs from the main checkout ${_c_dim}(values masked — --unmask shows them)${_c_rst}:"
+      grove_sync_show_masked "$src/$p" "$dst/$p"
+    fi
   done
   return $diverged
 }
 
-# grove_sync_show_diff <a> <b> — print the colored `git diff --no-index` body for
-# a divergence someone already decided *is* one, so this one is allowed to come
-# back empty (a type change prints nothing). Truncated, because the point is a
-# judgement call ("I don't care about that line"), not a full review.
+# grove_sync_show_masked <a> <b> [indent] — the default rendering of a
+# divergence someone already decided *is* one: what changed, never what it is.
+# Three shapes, chosen per pair:
+#   - two directories: one line per entry (`only in main` / `only in worktree`),
+#     recursing into entries present on both sides that differ — the same
+#     per-entry view `grove sync` itself takes of a directory;
+#   - two dotenv files: one line per key, the shape the conflict report already
+#     uses, plus `empty in main, worktree N chars` for a placeholder `grove sync`
+#     would fill (#36) — so the masked report also says what to do next;
+#   - anything else: the stripped diff with every -/+ line replaced by its
+#     length and the context lines dropped (a neighbour that agrees is still a
+#     secret). Hunk headers stay — they are the only thing left to act on.
+grove_sync_show_masked() {
+  local a="$1" b="$2" pre="${3:-    }" e rc
+  if [ -d "$a" ] && [ -d "$b" ] && [ ! -L "$a" ] && [ ! -L "$b" ]; then
+    local entries=()
+    local -A seen_entry=()
+    while IFS= read -r -d '' e; do
+      e=${e#./}
+      [ -n "$e" ] || continue
+      [ -n "${seen_entry[$e]+x}" ] && continue
+      seen_entry["$e"]=1; entries+=("$e")
+    done < <(grove_sync_entries "$a" "$b")
+    for e in ${entries[@]+"${entries[@]}"}; do
+      if [ ! -e "$a/$e" ] && [ ! -L "$a/$e" ]; then printf '%s%s: only in worktree\n' "$pre" "$e" >&2; continue; fi
+      if [ ! -e "$b/$e" ] && [ ! -L "$b/$e" ]; then printf '%s%s: only in main\n' "$pre" "$e" >&2; continue; fi
+      rc=0; grove_sync_differs "$a/$e" "$b/$e" || rc=$?
+      [ "$rc" = 0 ] && continue
+      if [ "$rc" = 2 ]; then printf '%s%s: could not be compared\n' "$pre" "$e" >&2; continue; fi
+      printf '%s%s:\n' "$pre" "$e" >&2
+      grove_sync_show_masked "$a/$e" "$b/$e" "$pre  "
+    done
+    return 0
+  fi
+  grove_sync_mask_dotenv "$a" "$b" "$pre" && return 0
+  grove_sync_show_diff "$a" "$b" mask "$pre"
+}
+
+# grove_sync_mask_dotenv <a> <b> <indent> — per-key report for two dotenv
+# files (names and lengths, never values). Returns 1 when either side isn't
+# dotenv-shaped, so the caller falls back to the masked diff.
+grove_sync_mask_dotenv() {
+  local a="$1" b="$2" pre="$3" k n=0
+  local a_keys=()
+  local -A a_val=()
+  grove_dotenv_scan "$a" || return 1
+  a_keys=(${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"})
+  for k in ${a_keys[@]+"${a_keys[@]}"}; do a_val["$k"]="${GROVE_DOTENV_VAL[$k]}"; done
+  grove_dotenv_scan "$b" || return 1
+  for k in ${a_keys[@]+"${a_keys[@]}"}; do
+    if [ -z "${GROVE_DOTENV_VAL[$k]+x}" ]; then
+      printf '%s%s%s%s: only in main\n' "$pre" "$_c_bld" "$k" "$_c_rst" >&2; n=$((n + 1))
+    elif [ "${a_val[$k]}" = "${GROVE_DOTENV_VAL[$k]}" ]; then
+      continue
+    elif [ -z "${a_val[$k]}" ]; then
+      printf "%s%s%s%s: empty in main, worktree %s chars %s('grove sync' fills it)%s\n" \
+        "$pre" "$_c_bld" "$k" "$_c_rst" "${#GROVE_DOTENV_VAL[$k]}" "$_c_dim" "$_c_rst" >&2; n=$((n + 1))
+    elif [ -z "${GROVE_DOTENV_VAL[$k]}" ]; then
+      printf "%s%s%s%s: empty in worktree, main %s chars %s('grove sync' fills it)%s\n" \
+        "$pre" "$_c_bld" "$k" "$_c_rst" "${#a_val[$k]}" "$_c_dim" "$_c_rst" >&2; n=$((n + 1))
+    else
+      printf '%s%s%s%s: differs (main %s chars, worktree %s chars)\n' \
+        "$pre" "$_c_bld" "$k" "$_c_rst" "${#a_val[$k]}" "${#GROVE_DOTENV_VAL[$k]}" >&2; n=$((n + 1))
+    fi
+  done
+  for k in ${GROVE_DOTENV_KEYS[@]+"${GROVE_DOTENV_KEYS[@]}"}; do
+    [ -n "${a_val[$k]+x}" ] && continue
+    printf '%s%s%s%s: only in worktree\n' "$pre" "$_c_bld" "$k" "$_c_rst" >&2; n=$((n + 1))
+  done
+  # Unreachable through grove_sync_differs (same keys and values read as in
+  # sync), but a renderer must never print nothing for a divergence.
+  [ "$n" -gt 0 ] || printf '%s%s(same keys and values — differs only in comments, order or quoting)%s\n' \
+    "$pre" "$_c_dim" "$_c_rst" >&2
+  return 0
+}
+
+# grove_sync_show_diff <a> <b> [mask] [indent] — print the `git diff --no-index`
+# body for a divergence someone already decided *is* one, so this one is allowed
+# to come back empty (a type change prints nothing). Truncated, because the
+# point is a judgement call ("I don't care about that line"), not a full review.
+# Colored when unmasked on a terminal; with <mask> every content line becomes
+# its length (see grove_sync_diff_body) and color is off, since nothing
+# printed is content any more.
 grove_sync_show_diff() {
-  local a="$1" b="$2" color=never max=40 d body
-  [ -t 2 ] && color=always
+  local a="$1" b="$2" mask="${3:-}" pre="${4:-    }" color=never max=40 d body
+  [ -t 2 ] && [ -z "$mask" ] && color=always
   d=$(git --no-pager diff --no-index --no-ext-diff --no-textconv "--color=$color" \
         -- "$a" "$b" 2>/dev/null) || true
-  body=$(grove_sync_diff_body "$d" "$a" "$b")
+  body=$(grove_sync_diff_body "$d" "$a" "$b" "$mask")
   if [ -z "$body" ]; then
-    printf '    %s(no textual diff — the two are not the same kind of file)%s\n' \
-      "$_c_dim" "$_c_rst" >&2
+    printf '%s%s(no textual diff — the two are not the same kind of file)%s\n' \
+      "$pre" "$_c_dim" "$_c_rst" >&2
     return 0
   fi
   { printf '%s\n' "$body" | head -n "$max" || true; } >&2
   if [ "$(printf '%s\n' "$body" | wc -l)" -gt "$max" ]; then
-    printf '    %s… diff truncated%s\n' "$_c_dim" "$_c_rst" >&2
+    printf '%s%s… diff truncated%s\n' "$pre" "$_c_dim" "$_c_rst" >&2
   fi
   return 0
 }
 
-# grove_sync_diff_body <diff> <src-path> <dst-path> — strip git's file headers
-# from a `--no-index` diff for display. For a single file the `warn` line above
-# already names it, so the headers are pure noise (they carry absolute paths).
-# For a *directory* sync.path the diff spans many files, and dropping the headers
-# would leave anonymous hunks nobody can act on — so there the `+++` line is
-# rewritten to a short path relative to the synced root. Matching is done on a
-# color-stripped copy of each line, so printed lines keep their ANSI attributes.
+# grove_sync_diff_body <diff> <src-path> <dst-path> [mask] — strip git's file
+# headers from a `--no-index` diff for display. For a single file the `warn`
+# line above already names it, so the headers are pure noise (they carry
+# absolute paths). For a *directory* sync.path the diff spans many files, and
+# dropping the headers would leave anonymous hunks nobody can act on — so there
+# the `+++` line is rewritten to a short path relative to the synced root.
+# Matching is done on a color-stripped copy of each line, so printed lines keep
+# their ANSI attributes. With <mask>, a `-`/`+` line is replaced by
+# `- [N chars]` and context lines are dropped: what changed, not what it is.
 grove_sync_diff_body() {
-  local d="$1" srcp="$2" dstp="$3" multi=0
+  local d="$1" srcp="$2" dstp="$3" mask="${4:-}" multi=0
   [ -d "$srcp" ] || [ -d "$dstp" ] && multi=1
   # LC_ALL=C: a diff of a file git judged textual can still carry bytes that
   # aren't valid in the ambient locale, and awk aborts mid-stream on those
   # ("multibyte conversion failure"), mangling the very output the guard exists
   # to show. Byte semantics keep it a pass-through.
-  printf '%s\n' "$d" | LC_ALL=C awk -v e=$'\033' -v multi="$multi" \
+  printf '%s\n' "$d" | LC_ALL=C awk -v e=$'\033' -v multi="$multi" -v mask="$mask" \
       -v sp="$srcp/" -v dp="$dstp/" '
     function plain(s) { gsub(e "\\[[0-9;]*m", "", s); return s }
     {
@@ -617,6 +715,12 @@ grove_sync_diff_body() {
         if (name != "" && name != "/dev/null") { print "  " name ":" ; next }
       }
       if (l ~ /^(diff --git |index |--- |\+\+\+ |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )/) next
+      if (mask != "") {
+        # Length in bytes (LC_ALL=C) of the content after the -/+ marker. A
+        # context line is a neighbour both sides agree on — still a secret.
+        if (l ~ /^[-+]/) { print substr(l, 1, 1) " [" (length(l) - 1) " chars]"; next }
+        if (l ~ /^ /) next
+      }
       print
     }'
 }
@@ -1426,7 +1530,7 @@ grove_go() {
 }
 
 # =============================================================================
-# grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+# grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
 # The inverse of `grove go`: close the cmux workspace attached to <branch> and
 # remove its worktree. grove owns the workspace↔branch bridge (nobody else knows
 # it), so it closes the tab `wt remove`/`wt merge` would otherwise strand; the
@@ -1437,7 +1541,7 @@ grove_go() {
 # branch is kept, never deleted, unless -D.
 # =============================================================================
 grove_rm() {
-  local opt_force="" opt_forcedel="" opt_keep="" opt_reap="" opt_no_fetch="" branch=""
+  local opt_force="" opt_unmask="" opt_forcedel="" opt_keep="" opt_reap="" opt_no_fetch="" branch=""
   # Unlike `grove go` (whose trailing tokens are the prompt), `grove rm` has no
   # free-form tail — so flags may appear in any position and a second positional
   # is a mistake we reject, rather than silently dropping a post-branch --force
@@ -1445,11 +1549,12 @@ grove_rm() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -f|--force)         opt_force=1; shift ;;
+      --unmask)           opt_unmask=1; shift ;;
       -D|--force-delete)  opt_forcedel=1; shift ;;
       --keep-branch)      opt_keep=1; shift ;;
       --reap)             opt_reap=1; shift ;;
       --no-fetch)         opt_no_fetch=1; shift ;;
-      -h|--help)          echo "usage: grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]"; return 0 ;;
+      -h|--help)          echo "usage: grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]"; return 0 ;;
       --)            shift
                      while [ $# -gt 0 ]; do
                        [ -z "$branch" ] || die "grove rm: unexpected argument '$1'"
@@ -1494,10 +1599,12 @@ grove_rm() {
   #    .env & friends live only on disk: git can't preserve them, and wt's
   #    dirty-tree refusal can't see them (they're gitignored, so they're never
   #    "dirty"). So diff each configured path against the main checkout and
-  #    refuse on divergence, printing the diff — enough to judge "I don't care
-  #    about that line" and re-run with --force. --force doesn't silence the
-  #    finding, it just downgrades it to a one-line warning: the removal is
-  #    still discarding content that exists nowhere else.
+  #    refuse on divergence, reporting *what* differs — keys and lengths, not
+  #    values (#37): the diff is the secrets. Enough to judge "I don't care
+  #    about that line" and re-run with --force; --unmask prints the real diff
+  #    when the judgement needs it. --force doesn't silence the finding, it
+  #    just downgrades it to a one-line warning (unless --unmask asked for the
+  #    diff): the removal is still discarding content that exists nowhere else.
   if [ -n "$wtpath" ]; then
     # Candidates come from every root that could name one: the worktree grove
     # was invoked from, the worktree being torn down (a branch may have added a
@@ -1506,9 +1613,9 @@ grove_rm() {
     # grove_sync_resolve_paths for why the guard is monotone.
     grove_config_load "$WORKTREE_ROOT"
     grove_sync_resolve_paths "$WORKTREE_ROOT" "$wtpath" "$canon_repo"
-    if ! grove_sync_check "$canon_repo" "$wtpath" "$opt_force"; then
+    if ! grove_sync_check "$canon_repo" "$wtpath" "$opt_force" "$opt_unmask"; then
       [ -n "$opt_force" ] \
-        || die "synced paths differ from the main checkout (above) — copy what you need, then re-run 'grove rm --force'"
+        || die "synced paths differ from the main checkout (above) — copy what you need, then re-run 'grove rm --force' (--unmask shows the values)"
       warn "--force: removing anyway — the divergence above is discarded"
     fi
   fi
@@ -1653,7 +1760,7 @@ grove_sync() {
   local sub="${1:-copy}"; [ $# -gt 0 ] && shift
   case "$sub" in
     -h|--help)
-      echo "usage: grove sync [list|check|add [--local] <path>...|rm [--local] <path>...]"
+      echo "usage: grove sync [list|check [--unmask]|add [--local] <path>...|rm [--local] <path>...]"
       return 0 ;;
     copy|list|check|add|rm) ;;
     -*) die "grove sync: unknown option '$sub'" ;;
@@ -1663,6 +1770,8 @@ grove_sync() {
   # Reject stray args on the argument-less subcommands before anything else, so
   # a typo can't be masked by an earlier "nothing configured" return. `go`/`rm`/
   # `restyle` all die on unknown arguments too.
+  local unmask=""
+  if [ "$sub" = check ] && [ "${1:-}" = --unmask ]; then unmask=1; shift; fi
   case "$sub" in
     copy|check|list)
       [ $# -eq 0 ] \
@@ -1704,10 +1813,11 @@ grove_sync() {
              return 1
            fi
            info "sync complete for ${_c_bld}$(basename "$canon_wt")${_c_rst}" ;;
-    check) if grove_sync_check "$canon_repo" "$canon_wt"; then
+    check) if grove_sync_check "$canon_repo" "$canon_wt" "" "$unmask"; then
              info "all synced paths match the main checkout"
            else
-             err "synced paths differ from the main checkout (above)"
+             if [ -n "$unmask" ]; then err "synced paths differ from the main checkout (above)"
+             else err "synced paths differ from the main checkout (above; 'grove sync check --unmask' shows the values)"; fi
              return 1
            fi ;;
     list)  printf '%ssync.paths%s %s(from %s)%s\n' \
@@ -1931,11 +2041,13 @@ ${_c_bld}Usage:${_c_rst}
                                   New branches fetch and branch from origin/<default>
                                   by default; --base <ref> overrides the base (e.g.
                                   @ for current HEAD), --no-fetch stays offline.
-  grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+  grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
                                   Tear down a worktree you're done with: close its
                                   cmux workspace and 'wt remove' the worktree
                                   (defaults to the current branch). Safe by default —
-                                  refuses a dirty tree without --force, and deletes
+                                  refuses a dirty tree without --force, refuses while
+                                  a synced path differs from the main checkout
+                                  (reported masked; --unmask shows values), and deletes
                                   the branch only if merged (squash-aware; fetches
                                   origin/<default> first so a fresh squash-merge
                                   counts — --no-fetch skips). -D force-deletes an
@@ -1943,15 +2055,18 @@ ${_c_bld}Usage:${_c_rst}
                                   If the tab anchors its cmux group, the group is
                                   re-anchored to the repo header first (a group is
                                   never dissolved; refuses to close on failure).
-  grove sync [list|check|add|rm]  Manage the untracked paths carried into worktrees
+  grove sync [list|check [--unmask]|add|rm]
+                                  Manage the untracked paths carried into worktrees
                                   (sync.paths — .env & friends). Bare 'sync' fills the
                                   gaps in both directions: missing here are copied from
                                   the main checkout, missing there are seeded from this
                                   worktree, and a .env both sides have gets its keys
                                   merged (a key with two different values is left alone
                                   and exits 1). Nothing is ever overwritten.
-                                  'check' diffs them against the main checkout and
-                                  exits 1 if any differ (what 'grove rm' guards on);
+                                  'check' compares them against the main checkout and
+                                  exits 1 if any differ (what 'grove rm' guards on),
+                                  reporting keys and lengths, never values — --unmask
+                                  prints the real diff;
                                   'list' shows each path's config + worktree state;
                                   'add'/'rm [--local] <path>...' edit .grove.json
                                   (--local writes .grove.local.json instead).
@@ -1985,7 +2100,8 @@ ${_c_bld}Synced untracked paths${_c_rst} (any of the layers above):
                  lists them. Before removing a worktree, 'grove rm' diffs each one
                  against the main checkout and refuses if any differs — so a
                  secret written only in the worktree is never deleted unseen;
-                 --force removes anyway. Manage all of it with 'grove sync'.
+                 --force removes anyway. Values are masked in every report
+                 (--unmask shows them). Manage all of it with 'grove sync'.
 
 ${_c_bld}Env:${_c_rst}
   GROVE_COMMAND command to launch (overrides agent.command; default: claude)
