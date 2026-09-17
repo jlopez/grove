@@ -482,7 +482,7 @@ Three shapes, chosen per pair. Two **dotenv** files get one line per key — the
 `grove sync` conflict report already used — and the placeholder case names its remedy. A
 **directory** is walked per entry (`only in main` / `only in worktree`, recursing into entries
 that differ), the same per-entry view `grove sync` takes of it. Anything else gets the
-stripped diff with every `-`/`+` line replaced by its byte length (`- [21 chars]`) and the
+stripped diff with every `-`/`+` line replaced by its byte length (`- [21 bytes]`) and the
 **context lines dropped** — a neighbour both sides agree on is still a secret; the `@@`
 headers stay, as the only thing left to act on. `--unmask` (on `grove sync check` and
 `grove rm`) prints the real colored `git diff --no-index` instead:

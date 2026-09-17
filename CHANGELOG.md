@@ -70,7 +70,7 @@ All notable changes to grove are documented here. Format follows
   `only in worktree` / `differs (main N chars, worktree M chars)`, and `empty in
   main, worktree N chars ('grove sync' fills it)` for a placeholder), a
   directory per entry, and anything else as the stripped diff with every
-  `-`/`+` line replaced by its length (`- [21 chars]`) and the context lines
+  `-`/`+` line replaced by its length (`- [21 bytes]`) and the context lines
   dropped — a neighbour both sides agree on is still a secret. Hunk headers stay
   stripped of git's function context either way. `--unmask` on `grove sync
   check` and `grove rm` prints the real colored diff; `grove rm --force
