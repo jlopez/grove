@@ -504,9 +504,75 @@ A path present in the worktree but **absent from the main checkout** is divergen
 is nothing to fall back on, so it's the case with the most to lose. The inverse (present in
 main, gone from the worktree) is not — nothing disappears.
 
+**One exception to "bytes decide": two dotenv files with the same keys and the same values.**
+That is exactly what the key merge below leaves behind — it appends to each file in place, so
+the two never become byte-identical again, only comment- and order-different. The guard's
+question is "does a secret live on one side only", and the answer there is no, so
+`grove_sync_differs` reports them as the same. What this knowingly gives up is a *comment*
+that exists only in the worktree (a commented-out alternate value, say): `grove rm` will no
+longer stop for it. The alternative was worse — a guard that blocks forever after every merge
+teaches people to reach for `--force`, which costs far more than a comment.
+
 `--force` doesn't silence the finding, it downgrades it to a one-line warning per path. The
 removal really is discarding content that exists nowhere else; that deserves a line in the
 scrollback even when it was the intent.
+
+### Both directions (`grove_sync_exchange`) — issue #34
+
+The copy side above has one built-in assumption: **the main checkout is the origin of every
+synced path.** It isn't. A path is naturally *born* on the branch that introduces it — run
+`grove sync add 260916-book-club/.env` from a feature worktree, where the file already exists,
+and the old one-way copy printed `absent from the main checkout (skipped)` and did nothing;
+`grove rm` on that worktree then demanded `--force`, because the guard (rightly) saw a secret
+that existed nowhere else. The feature contradicted itself.
+
+So bare `grove sync` fills the gap **in whichever direction it finds it**, with the
+never-overwrite rule untouched — only *which side may be the source* changed:
+
+- missing in the worktree → copied from the main checkout (what it always did);
+- missing in the main checkout → seeded from the worktree
+  (`seeded the main checkout from this worktree: <path>`);
+- a **directory** `sync.path` is resolved **per entry**, so it behaves like a bag of files:
+  each entry can be gap-filled on its own side rather than the whole tree being all-or-nothing;
+- `grove sync add` runs the same gap-fill for the added paths immediately, so the case that
+  motivated the issue is one command, not add-then-sync.
+
+The disqualifiers are checked on **both** roots now: `check-ignore` because the *receiving*
+side is the one that would be left dirty (and the two sides are on different branches, so
+their `.gitignore`s can differ), and `ls-files` because a path git tracks on the receiving
+side but that is missing from its working tree reads as a gap, and filling it would silently
+resurrect a file git is managing.
+
+`grove go` deliberately stays one-way. At spawn the worktree is new, and a reused one is not
+the moment to start writing into the main checkout behind the user's back; `grove sync` is the
+command you type when you mean it.
+
+**No `grove sync push` verb.** "Present on one side, absent on the other" has exactly one safe
+resolution, so a second word would only be one more thing to remember before getting the one
+outcome available.
+
+### dotenv key merge
+
+Gap-filling leaves the case where **both sides exist and differ**, which one-way copy never had
+to answer. For a `.env` the honest answer is usually *neither side is wrong*: it's a set of
+keys, and two checkouts that each added their own key have a union, not a conflict. So when
+both sides parse as dotenv, grove merges the key sets — keys present on one side only are
+**appended verbatim** to the other, carrying the author's own quoting and `export` prefix, and
+each file keeps its own order and comments. Nothing already written is ever rewritten.
+
+The parse is deliberately strict: every line must be blank, a `#` comment, or
+`[export ]KEY=VALUE`. A multi-line quoted value, JSON, a symlink (a deliberate "one shared
+file" setup — never ours to rewrite), or any byte of NUL takes the file out of scope entirely,
+and it falls back to the old behaviour: warn, point at `grove sync check`. The merge is a
+convenience for a shape it recognizes, never a guess about a file it doesn't.
+
+Values are compared **normalized** — surrounding whitespace dropped, one layer of matching
+quotes stripped — because `KEY=foo`, `KEY="foo"` and `KEY='foo'` are the same value, and
+quoting style is precisely the difference two hands introduce independently. A key both sides
+define with genuinely different values is a **conflict**: that path is left untouched on both
+sides (a half-merged `.env` is worse than an unmerged one), the conflicting key names and the
+diff are printed, and `grove sync` exits **1** — after processing every other path, because a
+conflict in one secret must not strand the other four.
 
 ### `grove sync` — the verb
 
@@ -516,7 +582,7 @@ close: you add `.env` to the main checkout *after* spawning five agents, and the
 exposed directly:
 
 ```
-grove sync                    # copy missing paths into this worktree (go's step 4)
+grove sync                    # fill the gaps both ways; merge dotenv keys (exit 1 on conflict)
 grove sync check              # diff vs the main checkout (rm's step 3); exit 1 if any differ
 grove sync list               # each path's config + worktree state
 grove sync add [--local] <p>… # edit .grove.json / .grove.local.json
@@ -528,8 +594,8 @@ positionals is the wrong shape; once those are subcommands, a `--list` alongside
 the worst of both. Bare `grove sync` is the verb (the `git stash` precedent: bare = the common
 action, named = the rest). `copy` is the internal name for the bare form.
 
-`copy` and `check` refuse to run **in the main checkout** — both compare main → worktree, so
-there's no destination distinct from the source. `check`'s exit status is the point of it: it
+`copy` and `check` refuse to run **in the main checkout** — both need a worktree distinct from
+it, and with nothing on the other side there is neither a gap to fill nor a diff to take. `check`'s exit status is the point of it: it
 composes into scripts and pre-remove hooks.
 
 **The setter is the thin part**, and deliberately so. Unlike `restyle`, whose reason to exist
@@ -538,8 +604,9 @@ has no apply step — so `add`/`rm` ride along on a command that earns its place
 Two things they do that hand-editing wouldn't:
 
 - **`add` validates.** A **tracked** path is refused outright — unambiguously a mistake, git
-  already carries it. Not-gitignored, or not-yet-existing, only *warn* and still write: you may
-  be about to add the `.gitignore` line or create the file. Silently accepting either would
+  already carries it (checked on both roots: a branch may have committed it). Not-gitignored,
+  or existing in *neither* checkout, only *warn* and still write: you may be about to add the
+  `.gitignore` line or create the file. Silently accepting either would
   just defer the confusion to the next `grove go`.
 - **The write direction matters.** `--local` seeds from the *effective* (merged) list, because
   jq's `*` replaces arrays and a local layer holding only the new path would silently supersede

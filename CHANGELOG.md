@@ -47,6 +47,34 @@ All notable changes to grove are documented here. Format follows
   one (jq's `*` replaces arrays).
 
 ### Fixed
+- **`sync.paths` assumed the main checkout was the origin of every synced path**
+  ([#34](https://github.com/jlopez/grove/issues/34)). A path is naturally *born*
+  on the branch that introduces it, so `grove sync add 260916-book-club/.env`
+  from a feature worktree printed `absent from the main checkout (skipped)`, did
+  nothing, and left `grove rm` demanding `--force` — the guard rightly seeing a
+  secret that existed nowhere else. Bare `grove sync` now fills the gap **in
+  whichever direction it finds it**, with the never-overwrite rule intact: only
+  which side may be the *source* changed. Seeding prints `seeded the main
+  checkout from this worktree: <path>`, a directory `sync.path` is resolved per
+  entry, and `grove sync add` runs the same gap-fill immediately so the case that
+  motivated the issue is one command. The disqualifiers (`ls-files`,
+  `check-ignore`) are now checked on **both** roots — the receiving side is the
+  one that would be left dirty, and a path git tracks there must not be silently
+  resurrected. `grove go` deliberately stays one-way.
+- **A `.env` both sides have is merged by key, not reported as a wall of diff.**
+  When both sides of a divergence parse as dotenv (blank / `#` comment /
+  `[export ]KEY=VALUE`, CRLF tolerated), keys present on one side only are
+  **appended verbatim** to the other — each file keeps its own order, comments
+  and quoting, and nothing already written is rewritten. Values compare
+  normalized, so `KEY=foo`, `KEY="foo"` and `KEY='foo'` are not a conflict. A key
+  both sides define with genuinely different values *is*: that path is left
+  untouched on both sides, its conflicting keys and diff are printed, and
+  `grove sync` exits **1** — after processing every other path. Anything that
+  isn't dotenv-shaped (multi-line values, JSON, a symlink, any NUL byte) keeps
+  the old behaviour: warn and point at `grove sync check`. Consequently the
+  teardown guard treats two dotenv files with the same keys and values as in
+  sync, so `grove rm` passes after a merge; the knowing cost is a comment that
+  exists only in the worktree no longer stopping the removal.
 - **The teardown guard decided divergence from whether a diff *printed*, not from
   git's exit status** — so `grove rm` deleted the worktree in three reachable
   cases where `git diff --no-index` reports a difference while emitting nothing:
