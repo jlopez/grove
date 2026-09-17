@@ -1783,12 +1783,56 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   set +eu
   source "$GROVE"
   [ "$(grove_dotenv_norm 'foo # note')" = "foo" ]
-  [ "$(grove_dotenv_norm '# only')" = "" ]
+  [ "$(grove_dotenv_norm ' # only')" = "" ]
+  [ "$(grove_dotenv_norm '#nospace')" = "#nospace" ]   # no whitespace before it: a value, not a comment
   [ "$(grove_dotenv_norm 'a#b')" = "a#b" ]           # no whitespace before it: part of the value
   [ "$(grove_dotenv_norm '"a # b"')" = "a # b" ]
   [ "$(grove_dotenv_norm '"a" # b')" = "a" ]
   [ "$(grove_dotenv_norm '"a"b')" = '"a"b' ]         # not a clean quote pair: kept whole
   [ "$(grove_dotenv_norm "''")" = "" ]
+}
+
+@test "dotenv_replace: a missing final newline stays missing; indentation of the placeholder is kept" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/ra" b="$BATS_TEST_TMPDIR/rb"
+  printf 'A=1\n  export B=' > "$a"; printf '   B=bee\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  [ "$(cat "$a")" = "$(printf 'A=1\n  export B=bee')" ]
+  [ -n "$(tail -c1 "$a")" ]                          # still no trailing newline
+}
+
+@test "sync_check: masked mode never mistakes a content line for a file header (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": ["cfg"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  mkdir -p "$SRC/cfg" "$DST/cfg"
+  printf -- '-- SECRETDASH\n++ bSECRETPLUS\n' > "$SRC/cfg/f"; printf 'zzz\n' > "$DST/cfg/f"
+  printf 'gone-SECRETGONE\n' > "$SRC/cfg/deleted"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"SECRET"* ]]
+  [[ "$output" == *"- [13 bytes]"* ]]
+  [[ "$output" == *"- [14 bytes]"* ]]
+  [[ "$output" == *"deleted: only in main"* ]]
+  run grove_sync_check "$SRC" "$DST" "" 1        # unmasked: the lines are shown, not stripped as headers
+  [[ "$output" == *"--- SECRETDASH"* ]]
+  [[ "$output" == *"-++ bSECRETPLUS"* ]]
+  [[ "$output" == *"  deleted:"* ]]              # a deleted file is labelled by its name, not /dev/null
+  [[ "$output" != *"/dev/null"* ]]
+}
+
+@test "sync_differs: a symlinked sync.path is compared by target, never opened for readability" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/lnk"; mkdir -p "$d/a" "$d/b"
+  printf 'S=1\n' > "$d/secret"; chmod 000 "$d/secret"
+  ln -s ../secret "$d/a/.env"; ln -s ../secret "$d/b/.env"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  chmod 644 "$d/secret"
+  [ "$status" -eq 0 ]
 }
 
 # ---- masked reports (#37) ---------------------------------------------------
@@ -1828,8 +1872,8 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   run grove_sync_check "$SRC" "$DST"
   [ "$status" -eq 1 ]
   [[ "$output" == *"@@ -1,3 +1,3 @@"* ]]
-  [[ "$output" == *"- [21 chars]"* ]]
-  [[ "$output" == *"+ [22 chars]"* ]]
+  [[ "$output" == *"- [21 bytes]"* ]]
+  [[ "$output" == *"+ [22 bytes]"* ]]
   [[ "$output" != *"hunter2"* ]]
   [[ "$output" != *"line one"* ]]             # context lines are neighbours: dropped
   [[ "$output" != *"line three"* ]]
@@ -1866,8 +1910,8 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [[ "$output" == *"a.env:"* ]]
   [[ "$output" == *"K: differs (main 10 chars, worktree 8 chars)"* ]]
   [[ "$output" == *"sub/notes:"* ]]
-  [[ "$output" == *"- [14 chars]"* ]]
-  [[ "$output" == *"+ [19 chars]"* ]]
+  [[ "$output" == *"- [14 bytes]"* ]]
+  [[ "$output" == *"+ [19 bytes]"* ]]
   [[ "$output" == *"c: only in worktree"* ]]
   [[ "$output" == *"m: only in main"* ]]
   [[ "$output" != *"same:"* ]]

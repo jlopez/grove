@@ -254,9 +254,12 @@ fi
 # independently. The comment rule follows bash and python-dotenv (`#` after
 # whitespace, or as the whole value); `a#b` stays `a#b`. It is what makes
 # `KEY= # paste it here` an *empty* placeholder (#36) rather than a 17-char
-# value that conflicts with the real key.
+# value that conflicts with the real key — while `KEY=#abc` stays `#abc`.
 grove_dotenv_norm() {
   local v="$1" q rest inner
+  # `KEY= # note` is empty; `KEY=#note` is the value `#note` — the comment rule
+  # needs whitespace before the `#`, and here the whitespace is the raw value's.
+  [[ "$v" =~ ^[[:space:]]+# ]] && { printf ''; return 0; }
   v="${v#"${v%%[![:space:]]*}"}"                 # ltrim
   v="${v%"${v##*[![:space:]]}"}"                 # rtrim
   case "$v" in
@@ -271,7 +274,6 @@ grove_dotenv_norm() {
         rest=${rest#*"$q"}
         if [[ "$rest" =~ ^[[:space:]]*(#.*)?$ ]]; then v=$inner; fi
       fi ;;
-    '#'*) v="" ;;                                # the whole value is a comment
     *)
       v=${v%%[[:space:]]#*}                      # `foo # note` → `foo`
       v="${v%"${v##*[![:space:]]}"}"             # rtrim again
@@ -346,34 +348,43 @@ grove_dotenv_append() {
 
 # grove_dotenv_replace <file> <lineno> <line> [<lineno> <line>...] — replace
 # the given 1-based lines of <file> in place, keeping every other byte (a CRLF
-# line stays CRLF). Truncate-and-rewrite on the same inode, so the file's mode
-# (`.env` is often 600) and any hard link survive.
+# line stays CRLF, a missing final newline stays missing). Truncate-and-rewrite
+# on the same inode, so the file's mode (`.env` is often 600) and any hard link
+# survive — the price is a window between truncate and write where a crash
+# would leave the file empty; short, and the content is in memory by then.
 grove_dotenv_replace() {
-  local f="$1" i; shift
+  local f="$1" i nonl=""; shift
   local -A repl=()
   while [ $# -ge 2 ]; do repl["$1"]="$2"; shift 2; done
   local lines=()
   mapfile -t lines < "$f"
+  [ ${#lines[@]} -gt 0 ] || return 0
+  [ -n "$(tail -c1 "$f")" ] && nonl=1
   for i in "${!lines[@]}"; do
     [ -n "${repl[$((i + 1))]+x}" ] || continue
     if [[ "${lines[$i]}" == *$'\r' ]]; then lines[i]="${repl[$((i + 1))]}"$'\r'
     else lines[i]="${repl[$((i + 1))]}"; fi
   done
-  printf '%s\n' "${lines[@]}" > "$f"
+  {
+    printf '%s\n' "${lines[@]:0:${#lines[@]}-1}"
+    if [ -n "$nonl" ]; then printf '%s' "${lines[-1]}"; else printf '%s\n' "${lines[-1]}"; fi
+  } > "$f"
 }
 
 # grove_dotenv_fill_line <placeholder-line> <donor-line> — the line that
-# replaces an empty placeholder: the donor's, verbatim (its quoting is the
-# author's), except that a placeholder written `export KEY=` keeps its `export`
-# — a file that is `source`d relies on it, and the donor may not have needed it.
+# replaces an empty placeholder: the donor's (its quoting is the author's) at
+# the placeholder's own indentation, and a placeholder written `export KEY=`
+# keeps its `export` — a file that is `source`d relies on it, and the donor may
+# not have needed it.
 grove_dotenv_fill_line() {
-  local ph="$1" donor="$2"
+  local ph="$1" donor="$2" lead
+  lead="${ph%%[![:space:]]*}"                    # the placeholder's own indent
+  donor="${donor#"${donor%%[![:space:]]*}"}"
   if [[ "$ph" =~ ^[[:space:]]*export[[:space:]] ]] \
-     && ! [[ "$donor" =~ ^[[:space:]]*export[[:space:]] ]]; then
-    donor="${donor#"${donor%%[![:space:]]*}"}"
-    printf 'export %s' "$donor"
+     && ! [[ "$donor" =~ ^export[[:space:]] ]]; then
+    printf '%sexport %s' "$lead" "$donor"
   else
-    printf '%s' "$donor"
+    printf '%s%s' "$lead" "$donor"
   fi
 }
 
@@ -499,8 +510,10 @@ grove_sync_differs() {
   # git reports an unreadable side as a plain difference (exit 1, nothing
   # printed), not as an error — and "differs" is the wrong answer: it lets
   # --force delete a file nobody has looked at. Ask the filesystem first.
+  # A symlink is compared by its target *string* and never opened, so its
+  # readability is beside the point (a shared secret may well be 0600 elsewhere).
   for f in "$1" "$2"; do
-    if [ -e "$f" ] && [ ! -r "$f" ]; then return 2; fi
+    if [ ! -L "$f" ] && [ -e "$f" ] && [ ! -r "$f" ]; then return 2; fi
   done
   git --no-pager diff --no-index --no-ext-diff --no-textconv --quiet \
     -- "$1" "$2" >/dev/null 2>&1 || rc=$?
@@ -573,8 +586,8 @@ grove_sync_check() {
 #     uses, plus `empty in main, worktree N chars` for a placeholder `grove sync`
 #     would fill (#36) — so the masked report also says what to do next;
 #   - anything else: the stripped diff with every -/+ line replaced by its
-#     length and the context lines dropped (a neighbour that agrees is still a
-#     secret). Hunk headers stay — they are the only thing left to act on.
+#     byte length and the context lines dropped (a neighbour that agrees is
+#     still a secret). Hunk headers stay — they are the only thing left to act on.
 grove_sync_show_masked() {
   local a="$1" b="$2" pre="${3:-    }" e rc
   if [ -d "$a" ] && [ -d "$b" ] && [ ! -L "$a" ] && [ ! -L "$b" ]; then
@@ -652,6 +665,9 @@ grove_sync_show_diff() {
   d=$(git --no-pager diff --no-index --no-ext-diff --no-textconv "--color=$color" \
         -- "$a" "$b" 2>/dev/null) || true
   body=$(grove_sync_diff_body "$d" "$a" "$b" "$mask")
+  # Masked bodies nest under per-entry labels, so they take the indent; the
+  # unmasked diff keeps its column-0 shape (it is what people paste into tools).
+  [ -n "$mask" ] && [ -n "$body" ] && body=$(printf '%s\n' "$body" | sed "s/^/$pre/")
   if [ -z "$body" ]; then
     printf '%s%s(no textual diff — the two are not the same kind of file)%s\n' \
       "$pre" "$_c_dim" "$_c_rst" >&2
@@ -672,7 +688,7 @@ grove_sync_show_diff() {
 # the `+++` line is rewritten to a short path relative to the synced root.
 # Matching is done on a color-stripped copy of each line, so printed lines keep
 # their ANSI attributes. With <mask>, a `-`/`+` line is replaced by
-# `- [N chars]` and context lines are dropped: what changed, not what it is.
+# `- [N bytes]` and context lines are dropped: what changed, not what it is.
 grove_sync_diff_body() {
   local d="$1" srcp="$2" dstp="$3" mask="${4:-}" multi=0
   [ -d "$srcp" ] || [ -d "$dstp" ] && multi=1
@@ -683,9 +699,23 @@ grove_sync_diff_body() {
   printf '%s\n' "$d" | LC_ALL=C awk -v e=$'\033' -v multi="$multi" -v mask="$mask" \
       -v sp="$srcp/" -v dp="$dstp/" '
     function plain(s) { gsub(e "\\[[0-9;]*m", "", s); return s }
+    # inhunk: between a @@ header and the next file header, every line is
+    # content — a removed line that happens to start with "-- " or "++ b" is
+    # not a file header and must not be stripped (or, masked, leaked).
+    { l = plain($0) }
+    l ~ /^diff --git / { inhunk = 0 }
+    inhunk {
+      if (mask != "") {
+        # Byte length (LC_ALL=C) of the content after the -/+ marker. A
+        # context line is a neighbour both sides agree on — still a secret.
+        if (l ~ /^[-+]/) { print substr(l, 1, 1) " [" (length(l) - 1) " bytes]"; next }
+        if (l ~ /^ /) next
+      }
+      print; next
+    }
     {
-      l = plain($0)
       if (l ~ /^@@ /) {
+        inhunk = 1
         # git appends "function context" to a hunk header: the nearest preceding
         # line that looks like a definition. In a .env that is *the line above the
         # change* — i.e. a neighbouring secret, printed verbatim into a terminal
@@ -709,18 +739,18 @@ grove_sync_diff_body() {
         if (l ~ /^old mode /) { oldm = m } else { print "  mode changed " oldm " -> " m }
         next
       }
+      if (multi && l ~ /^--- /) {
+        # Remembered for a deleted file, whose +++ side is /dev/null.
+        oldname = l; sub(/^--- a/, "", oldname)
+        idx = index(oldname, sp); if (idx) oldname = substr(oldname, idx + length(sp))
+      }
       if (multi && l ~ /^\+\+\+ /) {
-        name = l; sub(/^\+\+\+ b/, "", name)
+        name = l; sub(/^\+\+\+ b?/, "", name)
         idx = index(name, dp); if (idx) name = substr(name, idx + length(dp))
-        if (name != "" && name != "/dev/null") { print "  " name ":" ; next }
+        if (name == "/dev/null") name = oldname
+        if (name != "") { print "  " name ":" ; next }
       }
       if (l ~ /^(diff --git |index |--- |\+\+\+ |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )/) next
-      if (mask != "") {
-        # Length in bytes (LC_ALL=C) of the content after the -/+ marker. A
-        # context line is a neighbour both sides agree on — still a secret.
-        if (l ~ /^[-+]/) { print substr(l, 1, 1) " [" (length(l) - 1) " chars]"; next }
-        if (l ~ /^ /) next
-      }
       print
     }'
 }
