@@ -1147,12 +1147,14 @@ grove_write_style() {
 
 # ---- worktree / cmux resolution ---------------------------------------------
 # grove_worktrees — `wt list --format json` normalized to one {branch, path}
-# object per worktree. Two shapes exist: wt < 0.79 emits a bare array of
-# {branch, path}; wt >= 0.79 (schema 2) wraps rows in {schema, items: [...]}
-# with the path under .worktree.path (null for a branch with no worktree).
+# object per worktree. Two shapes exist: schema 1, a bare array of
+# {branch, path}; schema 2 (wt's default since 0.77, opt-in since 0.66), which
+# wraps rows in {schema, items: [...]} with the path under .worktree.path.
+# `[list] json-schema = 1` still selects the array. Either way, a branch with
+# no worktree (`[list] branches = true`) carries a null path and is dropped.
 grove_worktrees() {
   wt list --format json | jq -c '
-    if type == "array" then .[] | {branch, path}
+    if type == "array" then .[] | select(.path != null) | {branch, path}
     else .items[] | select(.worktree.path != null)
          | {branch, path: .worktree.path}
     end'
@@ -1464,6 +1466,12 @@ grove_go() {
   #    yet → empty key → title-only gate, as before.
   local wtpath canon_gate=""
   wtpath=$(grove_worktree_path "$branch") || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
+  # A registered worktree whose directory is gone (deleted, unmounted) is still
+  # listed with its path. Reusing it would spawn the agent in a dead cwd and let
+  # sync.paths `mkdir -p` a fake non-git dir there — stop instead.
+  if [ -n "$wtpath" ] && [ ! -d "$wtpath" ]; then
+    die "worktree for '$branch' is registered at $wtpath but the directory is missing — run 'git worktree prune' and re-run, or 'grove rm $branch' to tear it down"
+  fi
   if [ -n "$wtpath" ]; then
     canon_gate=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_gate="$wtpath"
   fi
