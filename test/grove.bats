@@ -792,6 +792,40 @@ JSON
   [ ! -f "$STUB/adds.log" ]
 }
 
+@test "adopt_orphans: reads wt >= 0.79's schema-2 listing (items[].worktree.path)" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  cat > "$STUB/wt.json" <<JSON
+{ "schema": 2, "items": [
+  { "branch": "main",      "worktree": { "path": "$STUB/repo-main", "main": true } },
+  { "branch": "feature/a", "worktree": { "path": "$STUB/wt-a" } },
+  { "branch": "feature/b", "worktree": { "path": "$STUB/wt-b" } },
+  { "branch": "no-wt" } ] }
+JSON
+  local canon_main; canon_main=$(cd "$STUB/repo-main" && pwd -P)
+  PATH="$STUB/bin:$PATH" \
+    grove_adopt_orphans "$STUB/bin/cmux" myrepo workspace_group:1 "$canon_main" 2>/dev/null
+  [ "$(cat "$STUB/adds.log")" = "workspace-group add --group workspace_group:1 --workspace workspace:3" ]
+}
+
+@test "worktree_path: resolves a branch under both wt JSON shapes; none → empty" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  PATH="$STUB/bin:$PATH"
+  [ "$(grove_worktree_path feature/a)" = "$STUB/wt-a" ]
+  [ -z "$(grove_worktree_path nope)" ]
+  cat > "$STUB/wt.json" <<JSON
+{ "schema": 2, "items": [
+  { "branch": "feature/a", "worktree": { "path": "$STUB/wt-a" } },
+  { "branch": "no-wt", "worktree": null } ] }
+JSON
+  [ "$(grove_worktree_path feature/a)" = "$STUB/wt-a" ]
+  [ -z "$(grove_worktree_path no-wt)" ]
+  [ -z "$(grove_worktree_path nope)" ]
+}
+
 @test "group_ref: returns the ref of the named group; unknown → empty" {
   set +eu
   source "$GROVE"
