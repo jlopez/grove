@@ -48,6 +48,16 @@ All notable changes to grove are documented here. Format follows
   one (jq's `*` replaces arrays).
 
 ### Fixed
+- **`grove go` / `grove rm` broke on worktrunk ≥ 0.77.** `wt list --format json`
+  now defaults to a schema-2 envelope (`{schema, items: [...]}`, path under
+  `.worktree.path`), so the lookup died with `jq: Cannot index number with string
+  "branch"` → "could not query worktrees". grove now normalizes both shapes in one
+  place (`grove_worktrees`), so older wt and `[list] json-schema = 1` keep working.
+  Worktree-less branch rows (`path: null`) no longer resolve to the string `null`.
+- **`grove go` no longer "reuses" a worktree whose directory is gone.** wt still
+  lists a registered-but-deleted worktree with its path; grove spawned the agent
+  there (and `sync.paths` recreated it as a plain directory). It now stops and
+  points at `git worktree prune`.
 - **An empty dotenv placeholder was a conflict, not a gap to fill**
   ([#36](https://github.com/jlopez/grove/issues/36)). `.env.example` ships
   `DEEPINFRA_API_KEY=`, the main checkout inherits the empty line, the real key

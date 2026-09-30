@@ -1146,11 +1146,24 @@ grove_write_style() {
 }
 
 # ---- worktree / cmux resolution ---------------------------------------------
+# grove_worktrees — `wt list --format json` normalized to one {branch, path}
+# object per worktree. Two shapes exist: schema 1, a bare array of
+# {branch, path}; schema 2 (wt's default since 0.77, opt-in since 0.66), which
+# wraps rows in {schema, items: [...]} with the path under .worktree.path.
+# `[list] json-schema = 1` still selects the array. Either way, a branch with
+# no worktree (`[list] branches = true`) carries a null path and is dropped.
+grove_worktrees() {
+  wt list --format json | jq -c '
+    if type == "array" then .[] | select(.path != null) | {branch, path}
+    else .items[] | select(.worktree.path != null)
+         | {branch, path: .worktree.path}
+    end'
+}
+
 # grove_worktree_path <branch> — print the worktree path worktrunk has for
-# <branch>, or nothing if no worktree exists yet. Reads `wt list --format json`.
+# <branch>, or nothing if no worktree exists yet.
 grove_worktree_path() {
-  wt list --format json | jq -r --arg b "$1" \
-    '.[] | select(.branch==$b) | .path' | head -1
+  grove_worktrees | jq -r --arg b "$1" 'select(.branch==$b) | .path' | head -1
 }
 
 # grove_title_in_group <groups-json> <workspaces-json> <repo> <branch> — exit 0
@@ -1292,7 +1305,7 @@ grove_adopt_orphans() {
   local groups workspaces wt_paths p canon
   groups=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null)  || return 0
   workspaces=$(CMUX_QUIET=1 "$cmux" workspace list --json 2>/dev/null)    || return 0
-  wt_paths=$(wt list --format json 2>/dev/null | jq -r '.[].path' 2>/dev/null) || return 0
+  wt_paths=$(grove_worktrees 2>/dev/null | jq -r '.path' 2>/dev/null) || return 0
   # Canonical paths of this repo's linked worktrees (main checkout excluded).
   local paths=()
   while IFS= read -r p; do
@@ -1453,6 +1466,12 @@ grove_go() {
   #    yet → empty key → title-only gate, as before.
   local wtpath canon_gate=""
   wtpath=$(grove_worktree_path "$branch") || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
+  # A registered worktree whose directory is gone (deleted, unmounted) is still
+  # listed with its path. Reusing it would spawn the agent in a dead cwd and let
+  # sync.paths `mkdir -p` a fake non-git dir there — stop instead.
+  if [ -n "$wtpath" ] && [ ! -d "$wtpath" ]; then
+    die "worktree for '$branch' is registered at $wtpath but the directory is missing — run 'git worktree prune' and re-run, or 'grove rm $branch' to tear it down"
+  fi
   if [ -n "$wtpath" ]; then
     canon_gate=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_gate="$wtpath"
   fi

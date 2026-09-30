@@ -792,6 +792,68 @@ JSON
   [ ! -f "$STUB/adds.log" ]
 }
 
+@test "adopt_orphans: reads wt >= 0.77's schema-2 listing (items[].worktree.path)" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  cat > "$STUB/wt.json" <<JSON
+{ "schema": 2, "items": [
+  { "branch": "main",      "worktree": { "path": "$STUB/repo-main", "main": true } },
+  { "branch": "feature/a", "worktree": { "path": "$STUB/wt-a" } },
+  { "branch": "feature/b", "worktree": { "path": "$STUB/wt-b" } },
+  { "branch": "no-wt" } ] }
+JSON
+  local canon_main; canon_main=$(cd "$STUB/repo-main" && pwd -P)
+  PATH="$STUB/bin:$PATH" \
+    grove_adopt_orphans "$STUB/bin/cmux" myrepo workspace_group:1 "$canon_main" 2>/dev/null
+  [ "$(cat "$STUB/adds.log")" = "workspace-group add --group workspace_group:1 --workspace workspace:3" ]
+}
+
+@test "worktree_path: resolves a branch under both wt JSON shapes; none → empty" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  PATH="$STUB/bin:$PATH"
+  [ "$(grove_worktree_path feature/a)" = "$STUB/wt-a" ]
+  [ -z "$(grove_worktree_path nope)" ]
+  cat > "$STUB/wt.json" <<JSON
+{ "schema": 2, "items": [
+  { "branch": "feature/a", "worktree": { "path": "$STUB/wt-a" } },
+  { "branch": "no-wt", "worktree": null } ] }
+JSON
+  [ "$(grove_worktree_path feature/a)" = "$STUB/wt-a" ]
+  [ -z "$(grove_worktree_path no-wt)" ]
+  [ -z "$(grove_worktree_path nope)" ]
+}
+
+@test "worktree_path: branch-only (path null) and detached (branch null) rows never match" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  PATH="$STUB/bin:$PATH"
+  # Schema 1 with `[list] branches = true`: a worktree-less branch has path null.
+  cat > "$STUB/wt.json" <<JSON
+[ { "branch": "lonely", "path": null, "kind": "branch" },
+  { "branch": null,     "path": "$STUB/wt-b" } ]
+JSON
+  [ -z "$(grove_worktree_path lonely)" ]
+  [ -z "$(grove_worktree_path null)" ]
+  cat > "$STUB/wt.json" <<JSON
+{ "schema": 2, "items": [ { "branch": null, "worktree": { "path": "$STUB/wt-b" } } ] }
+JSON
+  [ -z "$(grove_worktree_path null)" ]
+}
+
+@test "worktree_path: a failing wt is a non-zero exit (the callers' || die contract)" {
+  set +eu
+  source "$GROVE"
+  _adopt_setup
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB/bin/wt"
+  PATH="$STUB/bin:$PATH"
+  run grove_worktree_path feature/a
+  [ "$status" -ne 0 ]
+}
+
 @test "group_ref: returns the ref of the named group; unknown → empty" {
   set +eu
   source "$GROVE"
@@ -1966,4 +2028,17 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [[ "$output" != *"unknown option"* ]]
   run "$GROVE" rm -h
   [[ "$output" == *"--unmask"* ]]
+}
+
+@test "go: a registered worktree whose directory is gone dies before touching cmux" {
+  _adopt_setup
+  git init -q "$STUB/repo"
+  printf '[ { "branch": "gone", "path": "%s" } ]\n' "$STUB/deleted" > "$STUB/wt.json"
+  cd "$STUB/repo"
+  PATH="$STUB/bin:$PATH" GROVE_CMUX="$STUB/bin/cmux" GROVE_COMMAND=echo \
+    run "$GROVE" go gone "hi"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"directory is missing"*"git worktree prune"* ]]
+  [ ! -e "$STUB/deleted" ]         # nothing recreated the dead path
+  [ ! -f "$STUB/adds.log" ]        # cmux never touched
 }
