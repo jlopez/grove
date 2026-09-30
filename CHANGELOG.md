@@ -46,8 +46,109 @@ All notable changes to grove are documented here. Format follows
   doesn't exist yet, and `--local` **carries the effective list forward** rather
   than writing a one-element array that would silently supersede the committed
   one (jq's `*` replaces arrays).
+- `grove go` now **stamps grove's identity into each workspace it creates** via
+  per-workspace env (issue #18): `GROVE_WORKTREE_PATH` (canonicalized worktree
+  path — the durable match key), `GROVE_REPO_PATH`, and `GROVE_VERSION`, all
+  inherited by every shell in the tab (usable by user scripts/hooks). The
+  workspace matcher shared by the `grove go` attach gate and `grove rm`'s
+  close-target lookup is now **title-first with an env fallback**: a title hit
+  costs nothing extra, and on a miss grove sweeps the repo group's members'
+  stamped `GROVE_WORKTREE_PATH` (one `cmux workspace env` call each — cmux
+  omits env from `workspace list`). This fixes the orphaned-tab incident where
+  a branch renamed after `grove go` defeated the title match — the tab keeps
+  its creation title but the worktree *path* survives the rename (wt keeps the
+  original dir name), so `grove rm` now still finds and closes the tab, and the
+  attach gate still refuses a duplicate for a manually-renamed tab. Both
+  missing → today's fail-safe behavior, which permanently covers unstamped
+  workspaces (legacy, UI-created, or reused/adopted — env is create-time only,
+  cmux has no post-hoc setter).
+- `grove go` now **adopts orphaned workspaces** after a group dissolution (issue #23).
+  Closing a group's anchor tab dissolves the group but leaves its member workspaces
+  alive and ungrouped, and recreating the group only attached the newly spawned
+  workspace — stranding the survivors. Once the repo group is ensured, `grove go`
+  sweeps for workspaces in *no* group whose directory canonicalizes to one of this
+  repo's linked worktrees (main checkout excluded) and re-attaches them. Conservative
+  and idempotent: workspaces already in any group are never touched, and other repos'
+  workspaces never match — so the next `grove go` self-heals the sidebar.
+- `grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]` — the
+  inverse of `grove go`: tear down a worktree you're done with. grove owns the
+  workspace↔branch bridge nobody else knows, so it closes the cmux tab that
+  `wt remove`/`wt merge` would otherwise strand, then delegates the git side to
+  `wt remove -y`. It defaults to the current worktree's branch and guards the
+  primary checkout (never dissolves the group). It **removes the worktree first,
+  then closes the tab** — so running it from inside the worktree's own tab can't
+  kill grove before the removal runs. Safe by default via `wt`: it refuses a dirty
+  tree without `--force` and deletes the branch only when merged — squash-aware
+  (wt's six-condition check), with `origin/<default>` fetched first so a branch
+  squash-merged moments ago already counts as merged (`--no-fetch` opts out). An
+  unmerged branch is kept, never deleted, unless `-D`/`--force-delete`
+  (`--keep-branch` maps to `wt remove --no-delete-branch`; `--reap` kills stray
+  processes in the worktree; `-y` skips only worktrunk's hook-approval prompts,
+  matching `grove go`).
+- `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
+  running Claude on the prompt, filed under the repo's sidebar group.
+- `grove go` now branches **brand-new** worktrees from a freshly fetched
+  `origin/<default>` instead of the stale local default (issue #14). It detects the
+  default branch from `origin/HEAD` (no network), fetches just that one ref, and hands
+  `wt --base origin/<default>` — so agents start from current code and PRs don't need
+  rebasing. Two new flags (grove go's first flag parsing): `--base <ref>` overrides the
+  base (e.g. `@` for current HEAD, or the local default when you have unpushed commits),
+  and `--no-fetch` stays offline. Materialize/reuse of existing branches is untouched
+  (they have history → no base to choose), and every failure (no `origin/HEAD`, fetch
+  failure) degrades gracefully to the local default rather than hard-failing.
+- `grove go` now **resolves-or-creates** the worktree instead of always running
+  `wt switch -c` (which dead-ended on a branch/worktree that already existed,
+  issue #2). Two orthogonal guards run first: a **fail-fast cmux gate** stops with
+  a clear message if a workspace in the repo's group is already attached to the
+  branch (keyed on workspace title, scoped to the group), and a **primary-checkout
+  guard** refuses to spawn into the group header (the repo's main checkout). The
+  worktree itself is then reused if present, materialized if the branch exists, or
+  created otherwise — so revisiting a branch reopens it rather than failing.
+- Layered config store — a single resolver all of grove reads through. Four layers,
+  low → high: `${XDG_CONFIG_HOME:-~/.config}/grove/config.json` (machine-wide),
+  `<repo-root>/.grove.json` (committed), `<repo-root>/.grove.local.json` (gitignored,
+  personal), and an optional per-keypath `ENV_VAR`. Files deep-merge with jq's `*`
+  (last layer wins per key, arrays included); missing files are skipped and an invalid
+  layer is warned about and skipped. Group color/icon now resolve through the store, so
+  they can be set in any layer. `grove init` gitignores `.grove.local.json` when run
+  inside a repo.
+- Per-repo group color/icon. Each repo's cmux group gets a deterministic, contrast-
+  safe OKLCH color (hashed from the repo name) for at-a-glance scanning. Override via
+  a `<repo-root>/.grove.json` (`{ "color"?, "icon"? }`) read from the worktree you run
+  grove in — so it's committable on your branch. `color` accepts `#RRGGBB`, `"auto"`,
+  or `"inherit"` (clear); `icon` is an SF Symbol, and both attributes fully reconcile
+  (removing a key reverts grove's imperative state for it). Style is re-applied on every
+  `grove go` (so it survives cmux group recreation), or on demand with `grove restyle` —
+  which also accepts `--color #RRGGBB|auto|random|inherit` and `--icon <symbol>|none` to
+  write `.grove.json` for you (`--color random` stamps a random palette color). grove
+  sets color/icon via cmux's imperative API and never writes `cmux.json`; `byCwd` stays
+  yours for umbrellas.
+- Configurable agent invocation through the config store. `agent.command` (the
+  executable, default `claude`) and `agent.args` (an array of argv tokens passed
+  before the prompt) are read from any config layer; `grove go` quotes each token
+  with `printf %q`. `grove doctor` checks the resolved command rather than a
+  hardcoded `claude`.
+- `grove init [--with-multi-account]` — optional wiring: cmux Claude plugin,
+  `wt go` alias, and an opt-in direnv multi-account hook.
+- `grove doctor` — dependency and wiring check.
+- Homebrew formula and `curl | sh` installer.
 
 ### Fixed
+- **The env-stamp sweep now finds a tab dragged out of its repo group.** The
+  shared matcher's `GROVE_WORKTREE_PATH` fallback (issue #18) swept only the
+  repo group's members, so a workspace moved to another group — or to no group —
+  was invisible to it: `grove rm` reported "no cmux workspace attached" and left
+  the tab open, and the `grove go` gate could have spawned a duplicate. The
+  sweep now runs the repo group's members first, then every other workspace
+  (tabs whose `current_directory` matches the worktree ahead of the rest, so
+  the common case costs about one extra `workspace env` call). Safe by
+  construction: the stamp is a machine-unique canonicalized worktree path, so —
+  unlike the title match, which stays group-scoped — the wider reach cannot
+  false-match across repos. `grove rm`'s close line notes when the tab had left
+  the group, and refuses (with an explanation) to close a strayed tab that now
+  anchors some *other* group, since closing an anchor dissolves its group; if
+  the group listing itself failed, it declines to close a matched tab at all
+  rather than act without anchor knowledge.
 - **`grove go` / `grove rm` broke on worktrunk ≥ 0.77.** `wt list --format json`
   now defaults to a schema-2 envelope (`{schema, items: [...]}`, path under
   `.worktree.path`), so the lookup died with `jq: Cannot index number with string
@@ -193,91 +294,3 @@ All notable changes to grove are documented here. Format follows
   or creating the header as `grove go` does — and verifies the anchor actually
   moved before closing. If re-anchoring fails, it refuses to close the tab
   (with a clear warning) rather than dissolve the group.
-
-### Added
-- `grove go` now **stamps grove's identity into each workspace it creates** via
-  per-workspace env (issue #18): `GROVE_WORKTREE_PATH` (canonicalized worktree
-  path — the durable match key), `GROVE_REPO_PATH`, and `GROVE_VERSION`, all
-  inherited by every shell in the tab (usable by user scripts/hooks). The
-  workspace matcher shared by the `grove go` attach gate and `grove rm`'s
-  close-target lookup is now **title-first with an env fallback**: a title hit
-  costs nothing extra, and on a miss grove sweeps the repo group's members'
-  stamped `GROVE_WORKTREE_PATH` (one `cmux workspace env` call each — cmux
-  omits env from `workspace list`). This fixes the orphaned-tab incident where
-  a branch renamed after `grove go` defeated the title match — the tab keeps
-  its creation title but the worktree *path* survives the rename (wt keeps the
-  original dir name), so `grove rm` now still finds and closes the tab, and the
-  attach gate still refuses a duplicate for a manually-renamed tab. Both
-  missing → today's fail-safe behavior, which permanently covers unstamped
-  workspaces (legacy, UI-created, or reused/adopted — env is create-time only,
-  cmux has no post-hoc setter).
-- `grove go` now **adopts orphaned workspaces** after a group dissolution (issue #23).
-  Closing a group's anchor tab dissolves the group but leaves its member workspaces
-  alive and ungrouped, and recreating the group only attached the newly spawned
-  workspace — stranding the survivors. Once the repo group is ensured, `grove go`
-  sweeps for workspaces in *no* group whose directory canonicalizes to one of this
-  repo's linked worktrees (main checkout excluded) and re-attaches them. Conservative
-  and idempotent: workspaces already in any group are never touched, and other repos'
-  workspaces never match — so the next `grove go` self-heals the sidebar.
-- `grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]` — the
-  inverse of `grove go`: tear down a worktree you're done with. grove owns the
-  workspace↔branch bridge nobody else knows, so it closes the cmux tab that
-  `wt remove`/`wt merge` would otherwise strand, then delegates the git side to
-  `wt remove -y`. It defaults to the current worktree's branch and guards the
-  primary checkout (never dissolves the group). It **removes the worktree first,
-  then closes the tab** — so running it from inside the worktree's own tab can't
-  kill grove before the removal runs. Safe by default via `wt`: it refuses a dirty
-  tree without `--force` and deletes the branch only when merged — squash-aware
-  (wt's six-condition check), with `origin/<default>` fetched first so a branch
-  squash-merged moments ago already counts as merged (`--no-fetch` opts out). An
-  unmerged branch is kept, never deleted, unless `-D`/`--force-delete`
-  (`--keep-branch` maps to `wt remove --no-delete-branch`; `--reap` kills stray
-  processes in the worktree; `-y` skips only worktrunk's hook-approval prompts,
-  matching `grove go`).
-- `grove go <branch> [prompt...]` — create a worktree and spawn a cmux workspace
-  running Claude on the prompt, filed under the repo's sidebar group.
-- `grove go` now branches **brand-new** worktrees from a freshly fetched
-  `origin/<default>` instead of the stale local default (issue #14). It detects the
-  default branch from `origin/HEAD` (no network), fetches just that one ref, and hands
-  `wt --base origin/<default>` — so agents start from current code and PRs don't need
-  rebasing. Two new flags (grove go's first flag parsing): `--base <ref>` overrides the
-  base (e.g. `@` for current HEAD, or the local default when you have unpushed commits),
-  and `--no-fetch` stays offline. Materialize/reuse of existing branches is untouched
-  (they have history → no base to choose), and every failure (no `origin/HEAD`, fetch
-  failure) degrades gracefully to the local default rather than hard-failing.
-- `grove go` now **resolves-or-creates** the worktree instead of always running
-  `wt switch -c` (which dead-ended on a branch/worktree that already existed,
-  issue #2). Two orthogonal guards run first: a **fail-fast cmux gate** stops with
-  a clear message if a workspace in the repo's group is already attached to the
-  branch (keyed on workspace title, scoped to the group), and a **primary-checkout
-  guard** refuses to spawn into the group header (the repo's main checkout). The
-  worktree itself is then reused if present, materialized if the branch exists, or
-  created otherwise — so revisiting a branch reopens it rather than failing.
-- Layered config store — a single resolver all of grove reads through. Four layers,
-  low → high: `${XDG_CONFIG_HOME:-~/.config}/grove/config.json` (machine-wide),
-  `<repo-root>/.grove.json` (committed), `<repo-root>/.grove.local.json` (gitignored,
-  personal), and an optional per-keypath `ENV_VAR`. Files deep-merge with jq's `*`
-  (last layer wins per key, arrays included); missing files are skipped and an invalid
-  layer is warned about and skipped. Group color/icon now resolve through the store, so
-  they can be set in any layer. `grove init` gitignores `.grove.local.json` when run
-  inside a repo.
-- Per-repo group color/icon. Each repo's cmux group gets a deterministic, contrast-
-  safe OKLCH color (hashed from the repo name) for at-a-glance scanning. Override via
-  a `<repo-root>/.grove.json` (`{ "color"?, "icon"? }`) read from the worktree you run
-  grove in — so it's committable on your branch. `color` accepts `#RRGGBB`, `"auto"`,
-  or `"inherit"` (clear); `icon` is an SF Symbol, and both attributes fully reconcile
-  (removing a key reverts grove's imperative state for it). Style is re-applied on every
-  `grove go` (so it survives cmux group recreation), or on demand with `grove restyle` —
-  which also accepts `--color #RRGGBB|auto|random|inherit` and `--icon <symbol>|none` to
-  write `.grove.json` for you (`--color random` stamps a random palette color). grove
-  sets color/icon via cmux's imperative API and never writes `cmux.json`; `byCwd` stays
-  yours for umbrellas.
-- Configurable agent invocation through the config store. `agent.command` (the
-  executable, default `claude`) and `agent.args` (an array of argv tokens passed
-  before the prompt) are read from any config layer; `grove go` quotes each token
-  with `printf %q`. `grove doctor` checks the resolved command rather than a
-  hardcoded `claude`.
-- `grove init [--with-multi-account]` — optional wiring: cmux Claude plugin,
-  `wt go` alias, and an opt-in direnv multi-account hook.
-- `grove doctor` — dependency and wiring check.
-- Homebrew formula and `curl | sh` installer.

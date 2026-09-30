@@ -401,7 +401,10 @@ _ws_json() {
 { "workspaces": [
   { "ref": "workspace:19", "title": "grove",                    "custom_title": "grove" },
   { "ref": "workspace:34", "title": "fix/gh-2-reopen-workspace", "custom_title": "renamed-tab" },
-  { "ref": "workspace:50", "title": "feature/x",                "custom_title": "feature/x" }
+  { "ref": "workspace:50", "title": "feature/x",                "custom_title": "feature/x",
+    "current_directory": "/repos/wt/other-feature" },
+  { "ref": "workspace:61", "title": "strayed",                  "custom_title": "strayed",
+    "current_directory": "/repos/wt/strayed" }
 ] }
 JSON
 }
@@ -509,11 +512,15 @@ JSON
 
 # --- GROVE_* env stamp matcher (issue #18) -----------------------------------
 # grove_workspace_for is the shared matcher (grove go's attach gate + grove rm's
-# close-target lookup): title first, then a per-member `cmux workspace env`
-# sweep keyed on the stamped GROVE_WORKTREE_PATH. The sweep is exercised with a
+# close-target lookup): title first, then a `cmux workspace env` sweep keyed on
+# the stamped GROVE_WORKTREE_PATH — repo-group members first, then every other
+# workspace, so a tab dragged out of its group is still found (the stamp is a
+# machine-unique worktree path, so the wide sweep can't cross-repo false-match).
+# The sweep is exercised with a
 # stubbed cmux serving per-ref env JSON in the real `workspace env --json`
 # shape ({count, env: {...}, window_ref, workspace_ref}); reuses the gate
-# fixtures above (group 'grove' = workspace:19+34, 'other' = workspace:50).
+# fixtures above (group 'grove' = workspace:19+34, 'other' = workspace:50,
+# grouped nowhere = workspace:61).
 
 _env_setup() { # populates $ESTUB — a cmux stub serving `workspace env <ref> --json`
   ESTUB="$BATS_TEST_TMPDIR/envstub"
@@ -546,6 +553,13 @@ JSON
            "GROVE_REPO_PATH": "/repos/other", "GROVE_VERSION": "0.1.0" },
   "window_ref": "window:1", "workspace_ref": "workspace:50" }
 JSON
+  # workspace:61 = stamped, but a member of NO group (dragged out / dissolved)
+  cat > "$ESTUB/env-workspace-61.json" <<'JSON'
+{ "count": 3,
+  "env": { "GROVE_WORKTREE_PATH": "/repos/wt/strayed",
+           "GROVE_REPO_PATH": "/repos/grove", "GROVE_VERSION": "0.1.0" },
+  "window_ref": "window:1", "workspace_ref": "workspace:61" }
+JSON
 }
 
 @test "group_member_refs: lists the repo group's member refs, one per line" {
@@ -563,39 +577,148 @@ JSON
   [ -z "$(grove_group_member_refs 'not json' grove)" ]
 }
 
-@test "env_ref_in_group: matches the stamped GROVE_WORKTREE_PATH (skips unstamped)" {
+@test "env_sweep_refs: members first, then cwd-matching strangers, then the rest" {
+  set +eu
+  source "$GROVE"
+  # The order is the sweep's cost model: the repo group's members are the cheap
+  # common case; a tab dragged out of its group usually still sits in its
+  # worktree, so the cwd-matching stranger (workspace:61) goes ahead of the
+  # rest and the true match costs about one extra env call.
+  local out; out=$(grove_env_sweep_refs "$(_groups_json)" "$(_ws_json)" grove /repos/wt/strayed)
+  [ "$out" = "$(printf 'workspace:19\nworkspace:34\nworkspace:61\nworkspace:50')" ]
+}
+
+@test "env_sweep_refs: malformed listings → empty (fails closed)" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_env_sweep_refs 'not json' "$(_ws_json)" grove /repos/wt/strayed)" ]
+  [ -z "$(grove_env_sweep_refs '{}' '{}' grove /repos/wt/strayed)" ]
+}
+
+@test "env_sweep_refs: a workspace without a ref is dropped, never emitted as 'null'" {
+  set +eu
+  source "$GROVE"
+  # jq -r prints a null ref as the literal string "null", which the sweep's
+  # [ -n "$ref" ] guard would NOT catch — it would burn a `workspace env null`
+  # call. Refless entries are filtered out of the ordering instead.
+  local ws='{ "workspaces": [ { "title": "ghost" },
+                              { "ref": "workspace:61", "current_directory": "/x" } ] }'
+  [ "$(grove_env_sweep_refs '{ "groups": [] }' "$ws" grove /x)" = "workspace:61" ]
+}
+
+# --- grove rm's strayed-tab close guards (pure halves) -----------------------
+# The close path for a tab found OUTSIDE the repo group (the widened sweep's
+# new reach) makes two pure decisions: is the tab still a member (the "tab had
+# left group" annotation keys on this), and does it anchor some OTHER group
+# (then the close is refused — dissolving a group grove doesn't manage). The
+# cmux side of the close stays manually validated, per this repo's testing
+# policy; these pin the decisions themselves.
+
+@test "member_of_group: member → yes; stranger, unknown group, malformed → no" {
+  set +eu
+  source "$GROVE"
+  grove_member_of_group "$(_groups_json)" grove workspace:34
+  ! grove_member_of_group "$(_groups_json)" grove workspace:61
+  ! grove_member_of_group "$(_groups_json)" nope workspace:34
+  ! grove_member_of_group '{}' grove workspace:34
+}
+
+_anchor_guard_groups_json() {
+  cat <<'JSON'
+{ "groups": [
+  { "ref": "workspace_group:1", "name": "grove",
+    "anchor_workspace_ref": "workspace:19",
+    "member_workspace_refs": ["workspace:19", "workspace:34"] },
+  { "ref": "workspace_group:2", "name": "hold",
+    "anchor_workspace_ref": "workspace:50",
+    "member_workspace_refs": ["workspace:50"] }
+] }
+JSON
+}
+
+@test "anchor_of_other_group: names the other group a strayed tab anchors" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:50)" = "hold" ]
+}
+
+@test "anchor_of_other_group: the repo group's own anchor is not 'other'" {
+  set +eu
+  source "$GROVE"
+  # workspace:19 anchors the repo's OWN group — that is issue #22's re-anchor
+  # path, not this refusal's business.
+  [ -z "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:19)" ]
+}
+
+@test "anchor_of_other_group: a tab that anchors nothing → empty" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_anchor_of_other_group "$(_anchor_guard_groups_json)" grove workspace:34)" ]
+}
+
+@test "anchor_of_other_group: a NAMELESS group still triggers the refusal" {
+  set +eu
+  source "$GROVE"
+  # A group with no usable name must yield SOME identifier — an empty match
+  # here would skip the refusal and dissolve the group on close.
+  local g='{ "groups": [ { "ref": "workspace_group:9", "anchor_workspace_ref": "workspace:50" } ] }'
+  [ "$(grove_anchor_of_other_group "$g" grove workspace:50)" = "workspace_group:9" ]
+}
+
+@test "anchor_of_other_group: malformed listing → empty (fails closed)" {
+  set +eu
+  source "$GROVE"
+  [ -z "$(grove_anchor_of_other_group 'not json' grove workspace:50)" ]
+}
+
+@test "env_ref_sweep: matches the stamped GROVE_WORKTREE_PATH (skips unstamped)" {
   set +eu
   source "$GROVE"
   _env_setup
   # workspace:19 (empty env) is swept first and skipped; workspace:34 matches.
-  local r; r=$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/renamed)
+  local r; r=$(grove_env_ref_sweep "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove /repos/wt/renamed)
   [ "$r" = "workspace:34" ]
 }
 
-@test "env_ref_in_group: empty canon-path → nothing, and no cmux calls at all" {
+@test "env_ref_sweep: empty canon-path → nothing, and no cmux calls at all" {
   set +eu
   source "$GROVE"
   _env_setup
   # An empty key must short-circuit before any sweep: the recording stub proves
   # cmux was never invoked (calls.log is written on EVERY invocation).
-  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove "")" ]
+  [ -z "$(grove_env_ref_sweep "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "")" ]
   [ ! -e "$ESTUB/calls.log" ]
 }
 
-@test "env_ref_in_group: scoped to the repo group (other group's stamp never matches)" {
+@test "env_ref_sweep: reaches a stamped tab in ANOTHER group (moved-out tab)" {
   set +eu
   source "$GROVE"
   _env_setup
-  # workspace:50 carries this exact stamp but belongs to 'other', not 'grove'.
-  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/other-feature)" ]
+  # workspace:50 carries this exact stamp but sits in group 'other' — a tab
+  # dragged out of its repo group. The old group-scoped sweep missed it, so
+  # `grove rm` reported "no cmux workspace attached" while the tab stayed
+  # open (the 2026-09-02 incident). The stamp is a machine-unique worktree
+  # path — another repo's tab can never carry this one — so the wider sweep
+  # is safe and must find it.
+  local r; r=$(grove_env_ref_sweep "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove /repos/wt/other-feature)
+  [ "$r" = "workspace:50" ]
 }
 
-@test "env_ref_in_group: failed env read is skipped, no member matches → empty" {
+@test "env_ref_sweep: reaches a stamped tab in NO group at all" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # workspace:61 belongs to no group (dragged loose, or its group dissolved).
+  local r; r=$(grove_env_ref_sweep "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove /repos/wt/strayed)
+  [ "$r" = "workspace:61" ]
+}
+
+@test "env_ref_sweep: failed env read is skipped, nothing matches → empty" {
   set +eu
   source "$GROVE"
   _env_setup
   rm "$ESTUB/env-workspace-19.json"   # sweep hits a failing env read first
-  [ -z "$(grove_env_ref_in_group "$ESTUB/bin/cmux" "$(_groups_json)" grove /repos/wt/nope)" ]
+  [ -z "$(grove_env_ref_sweep "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove /repos/wt/nope)" ]
 }
 
 @test "workspace_for: title hit returns the ref with zero env sweeps" {
@@ -620,6 +743,19 @@ JSON
   local r
   r=$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "feature/gh-450-renamed" /repos/wt/renamed)
   [ "$r" = "workspace:34" ]
+}
+
+@test "workspace_for: title miss + tab dragged out of the group → found by stamp" {
+  set +eu
+  source "$GROVE"
+  _env_setup
+  # The 2026-09-02 incident end to end: the tab's title still equals its branch
+  # ('feature/x'), but the tab sits in group 'other' — so the group-scoped
+  # title match rightly misses (branch names DO collide across repos) and the
+  # widened env sweep recovers it by its stamp.
+  local r
+  r=$(grove_workspace_for "$ESTUB/bin/cmux" "$(_groups_json)" "$(_ws_json)" grove "feature/x" /repos/wt/other-feature)
+  [ "$r" = "workspace:50" ]
 }
 
 @test "workspace_for: both title and env miss → empty (fail-safe, legacy tabs)" {
