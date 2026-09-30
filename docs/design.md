@@ -704,7 +704,11 @@ not a config error, and it's what `grove sync check` is for.
   and the full context as JSON on stdin. `pre-start` blocks; `post-start` runs in the
   background.
 - **`wt list --format json`** is rich: branch, path, working-tree status, remote
-  ahead/behind, repo owner/host; `--full` adds CI + diffstat + LLM summaries.
+  ahead/behind, repo owner/host; `--full` adds CI + diffstat + LLM summaries. It
+  has two shapes: schema 1 is a bare array of `{branch, path, …}`; schema 2 (the
+  default since wt 0.77) is an envelope `{schema, repo, items: [...]}` with the
+  path under `items[].worktree.path`. grove reads it only through
+  `grove_worktrees`, which normalizes both to `{branch, path}` per worktree.
 
 ### Agent activity — worktrunk's marker vs cmux's native indicator
 
