@@ -792,7 +792,7 @@ JSON
   [ ! -f "$STUB/adds.log" ]
 }
 
-@test "adopt_orphans: reads wt >= 0.79's schema-2 listing (items[].worktree.path)" {
+@test "adopt_orphans: reads wt >= 0.77's schema-2 listing (items[].worktree.path)" {
   set +eu
   source "$GROVE"
   _adopt_setup
