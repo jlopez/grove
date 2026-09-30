@@ -1130,12 +1130,12 @@ _sync_fixture() {
   [ "$status" -eq 0 ]
 }
 
-@test "sync_check: a differing copy fails and diffs the change" {
+@test "sync_check --unmask: a differing copy fails and diffs the change" {
   set +eu
   source "$GROVE"
   _sync_fixture
   printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
-  run grove_sync_check "$SRC" "$DST"
+  run grove_sync_check "$SRC" "$DST" "" 1
   [ "$status" -eq 1 ]
   [[ "$output" == *".env differs"* ]]
   [[ "$output" == *"-A=1"* ]]
@@ -1187,7 +1187,7 @@ _sync_fixture() {
 @test "sync -h prints the subcommands" {
   run "$GROVE" sync -h
   [ "$status" -eq 0 ]
-  [[ "$output" == *"list|check|add"* ]]
+  [[ "$output" == *"list|check [--unmask]|add"* ]]
 }
 
 @test "sync rejects an unknown subcommand" {
@@ -1269,7 +1269,6 @@ _sync_fixture() {
 @test "sync_differs: status comes from git, not from whether a diff printed" {
   set +eu
   source "$GROVE"
-  set +eu
   local d; d="$BATS_TEST_TMPDIR/differs"; mkdir -p "$d/a" "$d/b"
   printf 'A=1\n' > "$d/a/.env"; printf 'A=1\n' > "$d/b/.env"
   run grove_sync_differs "$d/a/.env" "$d/b/.env"
@@ -1288,7 +1287,6 @@ _sync_fixture() {
   [ "$(id -u)" != 0 ] || skip "root reads everything"
   set +eu
   source "$GROVE"
-  set +eu
   local d; d="$BATS_TEST_TMPDIR/unreadable"; mkdir -p "$d/a" "$d/b"
   printf 'A=1\n' > "$d/a/.env"; printf 'A=2\n' > "$d/b/.env"; chmod 000 "$d/b/.env"
   run grove_sync_differs "$d/a/.env" "$d/b/.env"
@@ -1299,7 +1297,6 @@ _sync_fixture() {
 @test "sync_check: a textconv diff driver cannot make two files look identical" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   # A redacting driver collapses both sides to the same text — the guard must
   # still see a difference, because it asks git for a verdict, not for output.
@@ -1315,7 +1312,6 @@ _sync_fixture() {
 @test "sync_check and sync_list agree on divergence (they share one comparison)" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
   grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
@@ -1342,7 +1338,6 @@ _sync_fixture() {
 @test "sync_check: a directory path names each differing file in the diff" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": ["cfg"] } }' > "$SRC/.grove.json"
   grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
@@ -1359,7 +1354,6 @@ _sync_fixture() {
 @test "sync_write: add without --local does not promote local-layer paths" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   printf '%s\n' '{ "color": "#112233", "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
   printf '%s\n' '{ "sync": { "paths": [".env", "personal.key"] } }' > "$SRC/.grove.local.json"
@@ -1374,7 +1368,6 @@ _sync_fixture() {
 @test "sync_write: warns when a higher layer shadows the write (rm is a no-op)" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
   printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.local.json"
@@ -1386,7 +1379,6 @@ _sync_fixture() {
 @test "sync_write: refuses to overwrite a malformed target file" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
   printf '%s\n' '{ "color": "#112233",}' > "$SRC/.grove.json"   # trailing comma
   run grove_sync_write "$SRC" "" add ".env"
@@ -1398,7 +1390,6 @@ _sync_fixture() {
 @test "config_get_array: a wrong-typed key degrades to empty, no jq crash" {
   set +eu
   source "$GROVE"
-  set +eu
   GROVE_CONFIG_JSON='{"sync":"oops"}'
   run grove_config_get_array "sync.paths"
   [ "$status" -eq 0 ]
@@ -1408,7 +1399,6 @@ _sync_fixture() {
 @test "sync_path_ok: rejects a leading dash (it would parse as an option)" {
   set +eu
   source "$GROVE"
-  set +eu
   ! grove_sync_path_ok "-rf"
   ! grove_sync_path_ok "--local"
 }
@@ -1422,7 +1412,6 @@ _sync_fixture() {
 @test "sync_resolve_paths: unions every root, dedupes, preserves GROVE_CONFIG_JSON" {
   set +eu
   source "$GROVE"
-  set +eu
   local d; d="$BATS_TEST_TMPDIR/union"; mkdir -p "$d/main" "$d/wt"
   printf '%s\n' '{ "color": "#111111", "sync": { "paths": [".env", "shared"] } }' > "$d/main/.grove.json"
   printf '%s\n' '{ "sync": { "paths": ["personal"] } }' > "$d/main/.grove.local.json"
@@ -1430,14 +1419,16 @@ _sync_fixture() {
   grove_config_load "$d/wt"
   local before="$GROVE_CONFIG_JSON"
   grove_sync_resolve_paths "$d/wt" "$d/main"
-  [ "${GROVE_SYNC_PATHS[*]}" = "shared branch-only .env personal" ]
+  # main's effective list is just "personal": its .grove.local.json *replaces*
+  # the committed array (jq's `*`), which is why grove_sync_write carries the
+  # effective list forward. The union is of effective lists, one per root.
+  [ "${GROVE_SYNC_PATHS[*]}" = "shared branch-only personal" ]
   [ "$GROVE_CONFIG_JSON" = "$before" ]     # callers still need their own root's config
 }
 
 @test "sync_resolve_paths: the gitignored personal layer survives a worktree root" {
   set +eu
   source "$GROVE"
-  set +eu
   # .grove.local.json is gitignored, so it can only ever exist in the main
   # checkout — a worktree-only root would silently resolve to no paths at all,
   # disabling the teardown guard for exactly the 'sync add --local' workflow.
@@ -1452,10 +1443,11 @@ _sync_fixture() {
 @test "sync_check: a mode-only change is reported as a mode change" {
   set +eu
   source "$GROVE"
-  set +eu
   _sync_fixture
-  printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"; chmod +x "$DST/.env"
-  run grove_sync_check "$SRC" "$DST"
+  # Non-dotenv content: two dotenv files with the same keys and values read as
+  # in sync whatever their mode (the guard asks about secrets, not bits).
+  printf 'hello\n' > "$SRC/.env"; printf 'hello\n' > "$DST/.env"; chmod +x "$DST/.env"
+  run grove_sync_check "$SRC" "$DST" "" 1
   chmod 644 "$DST/.env"
   [ "$status" -eq 1 ]
   [[ "$output" == *"mode changed"* ]]
@@ -1481,4 +1473,633 @@ _sync_fixture() {
   [[ "$output" == *"RC=1"* ]]
   [[ "$output" == *"diff truncated"* ]]
   [[ "$output" != *"errexit off"* ]]
+}
+
+# ---- bidirectional gap-fill + dotenv merge (issue #34) ----------------------
+
+# A real main checkout + a real linked worktree. Both sides must be inside a git
+# repo, because the copy consults `check-ignore` on the *receiving* side too.
+_pair_fixture() {
+  SRC="$BATS_TEST_TMPDIR/pair-main"; DST="$BATS_TEST_TMPDIR/pair-wt"
+  mkdir -p "$SRC"
+  git -C "$SRC" init -q -b main
+  printf '%s\n' '.env' '.env.local' 'cfg/' '*.bin' 'proj/' > "$SRC/.gitignore"
+  git -C "$SRC" add .gitignore
+  git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm init
+  git -C "$SRC" -c user.email=t@t -c user.name=t worktree add -q -b feat "$DST"
+  printf '%s\n' '{ "sync": { "paths": [".env"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+}
+
+_pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
+  local json; json=$(printf '"%s",' "$@"); json="[${json%,}]"
+  printf '{ "sync": { "paths": %s } }\n' "$json" > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+}
+
+@test "sync_exchange: a path only in the worktree seeds the main checkout" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'BORN_HERE=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"seeded the main checkout from this worktree"* ]]
+  [ "$(cat "$SRC/.env")" = "BORN_HERE=1" ]
+  # …and the rm guard now passes, which was the whole point of #34.
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_exchange: a main-only path is still copied into the worktree" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'FROM_MAIN=1\n' > "$SRC/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"synced from the main checkout"* ]]
+  [ "$(cat "$DST/.env")" = "FROM_MAIN=1" ]
+}
+
+@test "sync_exchange: identical sides are a no-op" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ "$(cat "$SRC/.env")" = "A=1" ]
+  [ "$(cat "$DST/.env")" = "A=1" ]
+}
+
+@test "sync_exchange: absent from both sides is reported, not fatal" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"present in neither checkout"* ]]
+}
+
+@test "sync_exchange: disjoint dotenv keys merge both ways" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf '# main\nA=1\n'   > "$SRC/.env"
+  printf 'B=2\nexport C=3\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"merged dotenv keys"* ]]
+  grep -qx 'A=1' "$DST/.env"
+  grep -qx 'B=2' "$SRC/.env"
+  grep -qx 'export C=3' "$SRC/.env"      # the verbatim line crosses, export and all
+  grep -qx '# main' "$SRC/.env"          # each file keeps its own comments/order
+  [ "$(head -n1 "$SRC/.env")" = "# main" ]
+  # Both sides now hold the same keys, so the guard passes without byte equality.
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_exchange: the same key with two values is a conflict — exit 1, nothing written" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=1\nONLY_MAIN=m\n' > "$SRC/.env"
+  printf 'A=2\nONLY_WT=w\n'   > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sets these keys differently"* ]]
+  [[ "$output" == *"A: differs (main 1 chars, worktree 1 chars)"* ]]
+  [[ "$output" == *"values are not printed"* ]]
+  [ "$(cat "$SRC/.env")" = "$(printf 'A=1\nONLY_MAIN=m')" ]   # untouched…
+  [ "$(cat "$DST/.env")" = "$(printf 'A=2\nONLY_WT=w')" ]     # …on both sides
+}
+
+@test "sync_exchange: a conflict report leaks no value — not the conflicting one, not its neighbours" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  # The conflicting key sits *after* other lines, so a unified diff would carry a
+  # neighbour into the hunk header as git's "function context".
+  printf 'KEEP=shared-kept-value\nONLY_MAIN=main-only-value\nTOKEN=alphaalphaalpha\n' > "$SRC/.env"
+  printf 'KEEP=shared-kept-value\nONLY_WT=wt-only-value\nTOKEN=beta\n'                > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TOKEN: differs (main 15 chars, worktree 4 chars)"* ]]
+  [[ "$output" != *"alphaalphaalpha"* ]]     # the conflicting values
+  [[ "$output" != *"beta"* ]]
+  [[ "$output" != *"shared-kept-value"* ]]   # a line both sides agree on
+  [[ "$output" != *"main-only-value"* ]]     # a line only one side has
+  [[ "$output" != *"wt-only-value"* ]]
+  [[ "$output" != *"@@"* ]]                  # no diff at all, so no hunk header
+}
+
+@test "sync_check: a hunk header never carries git's function context (a neighbouring secret)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\nB=2\nC=3\nABS_TOKEN=neighbouring-secret\nD=4\n' > "$SRC/.env"
+  printf 'A=1\nB=2\nC=3\nABS_TOKEN=neighbouring-secret\nD=5\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST" "" 1        # --unmask: the real diff
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"@@"* ]]                  # the header itself is still useful
+  [[ "$output" == *"-D=4"* ]]                # the change is still shown
+  [[ "$output" == *"+D=5"* ]]
+  # The context line is legitimately in the body (git's 3 lines of context), but
+  # it must not ALSO be pasted onto the @@ header, which is what git does by
+  # default and what made it leak into one-line summaries.
+  [ "$(printf '%s\n' "$output" | grep -c 'neighbouring-secret')" -eq 1 ]
+  [[ "$(printf '%s\n' "$output" | grep '@@')" != *"neighbouring-secret"* ]]
+}
+
+@test "sync_exchange: a conflicting path doesn't stop the other paths" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths ".env" ".env.local"
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  printf 'LATER=1\n' > "$DST/.env.local"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [ "$(cat "$SRC/.env.local")" = "LATER=1" ]        # the innocent path still synced
+}
+
+@test "sync_exchange: a non-dotenv divergence is left alone with a warning" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf '{ "a": 1 }\n' > "$SRC/.env"
+  printf '{ "a": 2 }\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"aren't dotenv"* ]]
+  [[ "$output" == *"grove sync check"* ]]
+  [ "$(cat "$SRC/.env")" = '{ "a": 1 }' ]
+}
+
+@test "sync_exchange: a directory path is filled per entry, in both directions" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths "cfg"
+  mkdir -p "$SRC/cfg/keys" "$DST/cfg"
+  printf 'm\n' > "$SRC/cfg/keys/from-main"
+  printf 'w\n' > "$DST/cfg/from-wt"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DST/cfg/keys/from-main")" = "m" ]      # nested parents created
+  [ "$(cat "$SRC/cfg/from-wt")" = "w" ]
+}
+
+@test "sync_exchange: a receiving side whose parent directory is missing" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths "proj/deep/.env"
+  mkdir -p "$DST/proj/deep"; printf 'K=v\n' > "$DST/proj/deep/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SRC/proj/deep/.env")" = "K=v" ]
+}
+
+@test "sync_exchange: a path that isn't gitignored on the receiving side is skipped" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths "loose.txt"
+  printf 'LOOSE=1\n' > "$DST/loose.txt"             # untracked, but not ignored
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not gitignored"* ]]
+  [ ! -e "$SRC/loose.txt" ]
+}
+
+@test "sync_exchange: a symlink is copied, never merged" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'S=1\n' > "$BATS_TEST_TMPDIR/shared.env"
+  ln -s "$BATS_TEST_TMPDIR/shared.env" "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ -L "$SRC/.env" ]
+  [ "$(cat "$SRC/.env")" = "S=1" ]
+}
+
+# ---- the dotenv parser/merger itself ----------------------------------------
+
+@test "dotenv_scan: accepts comments, blanks, export and CRLF; rejects the rest" {
+  set +eu
+  source "$GROVE"
+  local f="$BATS_TEST_TMPDIR/e"
+  printf '# c\n\n  export A=1\nB = 2\n' > "$f"
+  grove_dotenv_scan "$f"
+  [ "${GROVE_DOTENV_VAL[A]}" = "1" ]
+  [ "${GROVE_DOTENV_VAL[B]}" = "2" ]
+  printf 'A=1\r\nB=2\r\n' > "$f"                    # CRLF
+  grove_dotenv_scan "$f"
+  [ "${GROVE_DOTENV_VAL[A]}" = "1" ]
+  [ "${GROVE_DOTENV_LINE[A]}" = "A=1" ]             # the CR never crosses over
+  printf 'A=1\nnot a dotenv line\n' > "$f"
+  ! grove_dotenv_scan "$f"
+  printf 'A="multi\nline"\n' > "$f"                 # multi-line values: not ours
+  ! grove_dotenv_scan "$f"
+  printf 'A=1\n' > "$f"; printf '\000' >> "$f"      # binary
+  ! grove_dotenv_scan "$f"
+  ln -s "$f" "$BATS_TEST_TMPDIR/link.env"
+  ! grove_dotenv_scan "$BATS_TEST_TMPDIR/link.env"
+  : > "$f"                                          # empty file parses, no keys
+  grove_dotenv_scan "$f"
+  [ "${#GROVE_DOTENV_KEYS[@]}" -eq 0 ]
+}
+
+@test "dotenv_norm: quoting and surrounding space don't make a value different" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_dotenv_norm 'foo')" = "foo" ]
+  [ "$(grove_dotenv_norm '"foo"')" = "foo" ]
+  [ "$(grove_dotenv_norm "'foo'")" = "foo" ]
+  [ "$(grove_dotenv_norm '  foo  ')" = "foo" ]
+  [ "$(grove_dotenv_norm '"a=b#c"')" = 'a=b#c' ]    # = and # inside quotes survive
+  [ "$(grove_dotenv_norm '"')" = '"' ]              # a lone quote isn't a pair
+}
+
+@test "dotenv_merge: same value written two ways is not a conflict" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/a" b="$BATS_TEST_TMPDIR/b"
+  printf 'A=foo\nM=1\n' > "$a"
+  printf 'A="foo"\nW=2\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  grep -qx 'W=2' "$a"
+  grep -qx 'M=1' "$b"
+  [ "$(grep -c '^A=' "$a")" -eq 1 ]                 # the shared key isn't duplicated
+  [ "$(grep -c '^A=' "$b")" -eq 1 ]
+}
+
+@test "dotenv_merge: a file with no trailing newline gains one before the append" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/a" b="$BATS_TEST_TMPDIR/b"
+  printf 'A=1' > "$a"                               # no final newline
+  printf 'B=2\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  grep -qx 'A=1' "$a"
+  grep -qx 'B=2' "$a"
+  [ "$(wc -l < "$a")" -eq 2 ]
+}
+
+@test "dotenv_merge: a duplicated key takes its last value, like a loader would" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/a" b="$BATS_TEST_TMPDIR/b"
+  printf 'A=1\nA=2\n' > "$a"
+  printf 'A=2\n' > "$b"
+  grove_dotenv_merge "$a" "$b"                      # last-wins ⇒ no conflict
+  [ "$(cat "$b")" = "A=2" ]
+}
+
+@test "sync_differs: dotenv files equal up to comments and order read as in sync" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/a" b="$BATS_TEST_TMPDIR/b"
+  printf '# mine\nA=1\nB=2\n' > "$a"
+  printf 'B="2"\nA=1\n'       > "$b"
+  grove_sync_differs "$a" "$b"                      # 0 — same keys, same values
+  printf 'B=3\nA=1\n' > "$b"
+  ! grove_sync_differs "$a" "$b"                    # a changed value still differs
+  printf 'A=1\n' > "$b"
+  ! grove_sync_differs "$a" "$b"                    # a missing key still differs
+}
+
+# ---- the verb, end to end ---------------------------------------------------
+
+@test "sync add: seeds the main checkout from this worktree immediately" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  rm -f "$SRC/.grove.json"
+  printf 'BORN_HERE=1\n' > "$DST/.env"
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync add .env"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"seeded the main checkout from this worktree"* ]]
+  [ "$(cat "$SRC/.env")" = "BORN_HERE=1" ]
+  [ "$(jq -c '.sync.paths' "$DST/.grove.json")" = '[".env"]' ]
+}
+
+@test "sync: bare sync from the main checkout still refuses" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  run bash -c "cd '$SRC' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not the main checkout"* ]]
+}
+
+@test "sync: a conflict exits 1 from the command, not just the helper" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sync incomplete"* ]]
+}
+
+@test "sync_exchange: a directory entry whose name contains a newline is one entry" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths "cfg"
+  mkdir -p "$SRC/cfg" "$DST/cfg"
+  printf 'x\n' > "$SRC/cfg/$(printf 'we\nird')"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DST/cfg/$(printf 'we\nird')")" = "x" ]
+  [[ "$output" != *"present in neither"* ]]     # no phantom half-entries
+}
+
+@test "sync_exchange: a path git tracks on the receiving side is never resurrected" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  _pair_paths ".env"
+  printf 'TRACKED=1\n' > "$SRC/.env"
+  git -C "$SRC" add -f .env
+  git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm env
+  rm -f "$SRC/.env"                              # tracked in main, absent on disk
+  printf 'MINE=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tracked by git"* ]]
+  [ ! -e "$SRC/.env" ]
+}
+
+# ---- empty placeholders (#36) -----------------------------------------------
+
+@test "sync_exchange: an empty placeholder in main is filled from the worktree (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf '# keys\nA=1\nDEEPINFRA_API_KEY=\nB=2\n' > "$SRC/.env"
+  printf 'A=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"filled empty placeholders in the main checkout"* ]]
+  [[ "$output" == *"DEEPINFRA_API_KEY (.env)"* ]]
+  [[ "$output" != *"abcdefghijklmnopqrstuvwxyz012345"* ]]     # the value travelled, it wasn't printed
+  [[ "$output" != *"differs"* ]]
+  # Filled in place: same position, the comment above it kept, nothing appended.
+  [ "$(cat "$SRC/.env")" = "$(printf '# keys\nA=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2')" ]
+  [ "$(cat "$DST/.env")" = "$(printf 'A=1\nDEEPINFRA_API_KEY=abcdefghijklmnopqrstuvwxyz012345\nB=2')" ]
+  run grove_sync_check "$SRC" "$DST"                            # and the guard now passes
+  [ "$status" -eq 0 ]
+}
+
+@test "sync_exchange: an empty placeholder in the worktree is filled from main (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'TOKEN=real-token-value\n' > "$SRC/.env"
+  printf 'TOKEN=\nEXTRA=1\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"filled empty placeholders in this worktree"* ]]
+  [[ "$output" == *"TOKEN (.env)"* ]]
+  [[ "$output" != *"real-token-value"* ]]
+  [ "$(cat "$DST/.env")" = "$(printf 'TOKEN=real-token-value\nEXTRA=1')" ]
+  [ "$(cat "$SRC/.env")" = "$(printf 'TOKEN=real-token-value\nEXTRA=1')" ]   # the disjoint key still merged
+}
+
+@test "sync_exchange: a quotes-only placeholder (\"\" / '') is empty too (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=""\nB='"''"'\n' > "$SRC/.env"
+  printf 'A=aaa\nB=bbb\n'   > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$SRC/.env")" = "$(printf 'A=aaa\nB=bbb')" ]
+}
+
+@test "sync_exchange: two different non-empty values are still a conflict (#36)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'A=one\nP=\n' > "$SRC/.env"
+  printf 'A=two\nP=filled\n' > "$DST/.env"
+  run grove_sync_exchange "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"A: differs (main 3 chars, worktree 3 chars)"* ]]
+  [[ "$output" != *"filled empty placeholders"* ]]
+  [ "$(cat "$SRC/.env")" = "$(printf 'A=one\nP=')" ]          # a conflict writes nothing, not even the fill
+  [ "$(cat "$DST/.env")" = "$(printf 'A=two\nP=filled')" ]
+}
+
+@test "dotenv_merge: placeholder edge cases — export kept, CRLF kept, both-empty untouched, trailing comment is not a value" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/pa" b="$BATS_TEST_TMPDIR/pb"
+  printf 'export E=\nQ=\r\nBOTH=\nC= # paste here\n' > "$a"
+  printf 'E="ee"\nQ=qq\nBOTH=""\nC=cval\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  [ "$(sed -n 1p "$a")" = 'export E="ee"' ]         # the placeholder's export prefix survives
+  [ "$(sed -n 2p "$a" | tr -d '\r')" = 'Q=qq' ]
+  [[ "$(sed -n 2p "$a")" == *$'\r' ]]                # a CRLF line stays CRLF
+  [ "$(sed -n 3p "$a")" = 'BOTH=' ]                  # empty on both sides: nothing to fill, no conflict
+  [ "$(sed -n 4p "$a")" = 'C=cval' ]                 # `KEY= # comment` was a placeholder, not a 10-char value
+  [ "${GROVE_DOTENV_FILLED_A[*]}" = "E Q C" ]
+  [ "${#GROVE_DOTENV_FILLED_B[@]}" -eq 0 ]
+  [ "$(wc -l < "$a")" -eq 4 ]                        # nothing appended
+}
+
+@test "dotenv_norm: an unquoted trailing comment is dropped, a quoted # is kept" {
+  set +eu
+  source "$GROVE"
+  [ "$(grove_dotenv_norm 'foo # note')" = "foo" ]
+  [ "$(grove_dotenv_norm ' # only')" = "" ]
+  [ "$(grove_dotenv_norm '#nospace')" = "#nospace" ]   # no whitespace before it: a value, not a comment
+  [ "$(grove_dotenv_norm 'a#b')" = "a#b" ]           # no whitespace before it: part of the value
+  [ "$(grove_dotenv_norm '"a # b"')" = "a # b" ]
+  [ "$(grove_dotenv_norm '"a" # b')" = "a" ]
+  [ "$(grove_dotenv_norm '"a"b')" = '"a"b' ]         # not a clean quote pair: kept whole
+  [ "$(grove_dotenv_norm "''")" = "" ]
+}
+
+@test "dotenv_replace: a missing final newline stays missing; indentation of the placeholder is kept" {
+  set +eu
+  source "$GROVE"
+  local a="$BATS_TEST_TMPDIR/ra" b="$BATS_TEST_TMPDIR/rb"
+  printf 'A=1\n  export B=' > "$a"; printf '   B=bee\n' > "$b"
+  grove_dotenv_merge "$a" "$b"
+  [ "$(cat "$a")" = "$(printf 'A=1\n  export B=bee')" ]
+  [ -n "$(tail -c1 "$a")" ]                          # still no trailing newline
+}
+
+@test "sync_check: masked mode never mistakes a content line for a file header (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": ["cfg"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  mkdir -p "$SRC/cfg" "$DST/cfg"
+  printf -- '-- SECRETDASH\n++ bSECRETPLUS\n' > "$SRC/cfg/f"; printf 'zzz\n' > "$DST/cfg/f"
+  printf 'gone-SECRETGONE\n' > "$SRC/cfg/deleted"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"SECRET"* ]]
+  [[ "$output" == *"- [13 bytes]"* ]]
+  [[ "$output" == *"- [14 bytes]"* ]]
+  [[ "$output" == *"deleted: only in main"* ]]
+  run grove_sync_check "$SRC" "$DST" "" 1        # unmasked: the lines are shown, not stripped as headers
+  [[ "$output" == *"--- SECRETDASH"* ]]
+  [[ "$output" == *"-++ bSECRETPLUS"* ]]
+  [[ "$output" == *"  deleted:"* ]]              # a deleted file is labelled by its name, not /dev/null
+  [[ "$output" != *"/dev/null"* ]]
+}
+
+@test "sync_differs: a symlinked sync.path is compared by target, never opened for readability" {
+  set +eu
+  source "$GROVE"
+  local d; d="$BATS_TEST_TMPDIR/lnk"; mkdir -p "$d/a" "$d/b"
+  printf 'S=1\n' > "$d/secret"; chmod 000 "$d/secret"
+  ln -s ../secret "$d/a/.env"; ln -s ../secret "$d/b/.env"
+  run grove_sync_differs "$d/a/.env" "$d/b/.env"
+  chmod 644 "$d/secret"
+  [ "$status" -eq 0 ]
+}
+
+# ---- masked reports (#37) ---------------------------------------------------
+
+@test "sync_check: a dotenv divergence is reported per key, and no value from either side is printed (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'KEEP=shared-kept-value\nONLY_MAIN=main-only-value\nTOKEN=alphaalphaalpha\nPH=\n' > "$SRC/.env"
+  printf 'KEEP=shared-kept-value\nONLY_WT=wt-only-value\nTOKEN=beta\nPH=filled-in-worktree\n'  > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *".env differs from the main checkout"* ]]
+  [[ "$output" == *"values masked"* ]]
+  [[ "$output" == *"ONLY_MAIN: only in main"* ]]
+  [[ "$output" == *"ONLY_WT: only in worktree"* ]]
+  [[ "$output" == *"TOKEN: differs (main 15 chars, worktree 4 chars)"* ]]
+  [[ "$output" == *"PH: empty in main, worktree 18 chars"* ]]   # and what to do about it
+  [[ "$output" == *"'grove sync' fills it"* ]]
+  [[ "$output" != *"KEEP:"* ]]                # a key both sides agree on isn't listed
+  [[ "$output" != *"shared-kept-value"* ]]
+  [[ "$output" != *"main-only-value"* ]]
+  [[ "$output" != *"wt-only-value"* ]]
+  [[ "$output" != *"alphaalphaalpha"* ]]
+  [[ "$output" != *"beta"* ]]
+  [[ "$output" != *"filled-in-worktree"* ]]
+  [[ "$output" != *"@@"* ]]                   # no diff at all
+  [[ "$output" != *"+"*"="* ]]
+}
+
+@test "sync_check: a non-dotenv divergence is a diff of lengths — headers kept, contents and context gone (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'line one\n{"secret": "hunter2"}\nline three\n' > "$SRC/.env"
+  printf 'line one\n{"secret": "hunter22"}\nline three\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"@@ -1,3 +1,3 @@"* ]]
+  [[ "$output" == *"- [21 bytes]"* ]]
+  [[ "$output" == *"+ [22 bytes]"* ]]
+  [[ "$output" != *"hunter2"* ]]
+  [[ "$output" != *"line one"* ]]             # context lines are neighbours: dropped
+  [[ "$output" != *"line three"* ]]
+  [[ "$output" != *"diff --git"* ]]
+}
+
+@test "sync_check --unmask overrides quiet mode: --force --unmask on rm still shows the diff (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'A=1\n' > "$SRC/.env"; printf 'A=2\n' > "$DST/.env"
+  run grove_sync_check "$SRC" "$DST" 1 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"+A=2"* ]]
+  run grove_sync_check "$SRC" "$DST" 1          # quiet alone: one line, no report at all
+  [[ "$output" != *"+A=2"* ]]
+  [[ "$output" != *"A: differs"* ]]
+}
+
+@test "sync_check: a directory path is reported per entry, masked (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf '%s\n' '{ "sync": { "paths": ["cfg"] } }' > "$SRC/.grove.json"
+  grove_config_load "$SRC"; grove_sync_resolve_paths "$SRC"
+  mkdir -p "$SRC/cfg/sub" "$DST/cfg/sub"
+  printf 'K=main-value\n' > "$SRC/cfg/a.env"; printf 'K=wt-value\n' > "$DST/cfg/a.env"
+  printf 'same\n' > "$SRC/cfg/same";          printf 'same\n' > "$DST/cfg/same"
+  printf 'free text main\n' > "$SRC/cfg/sub/notes"; printf 'free text worktree!\n' > "$DST/cfg/sub/notes"
+  printf 'c=1\n' > "$DST/cfg/c"
+  printf 'm=1\n' > "$SRC/cfg/m"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"a.env:"* ]]
+  [[ "$output" == *"K: differs (main 10 chars, worktree 8 chars)"* ]]
+  [[ "$output" == *"sub/notes:"* ]]
+  [[ "$output" == *"- [14 bytes]"* ]]
+  [[ "$output" == *"+ [19 bytes]"* ]]
+  [[ "$output" == *"c: only in worktree"* ]]
+  [[ "$output" == *"m: only in main"* ]]
+  [[ "$output" != *"same:"* ]]
+  [[ "$output" != *"main-value"* ]]
+  [[ "$output" != *"wt-value"* ]]
+  [[ "$output" != *"free text"* ]]
+  [[ "$output" != *"$SRC"* ]]
+  run grove_sync_check "$SRC" "$DST" "" 1        # --unmask: the unified diff, per-file labels
+  [[ "$output" == *"-K=main-value"* ]]
+  [[ "$output" == *"+K=wt-value"* ]]
+}
+
+@test "sync_check: masked mode still reports binary and mode-only changes (#37)" {
+  set +eu
+  source "$GROVE"
+  _sync_fixture
+  printf 'hello\n' > "$SRC/.env"; printf 'hello\n' > "$DST/.env"; chmod +x "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mode changed 100644 -> 100755"* ]]
+  printf 'A=1\n\000' > "$SRC/.env"; printf 'A=2\n\000' > "$DST/.env"; chmod 644 "$DST/.env"
+  run grove_sync_check "$SRC" "$DST"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"binary files differ"* ]]
+  [[ "$output" != *"A=2"* ]]
+}
+
+@test "sync check: the command masks by default and --unmask shows the values; rm parses --unmask (#37)" {
+  set +eu
+  source "$GROVE"
+  _pair_fixture
+  printf 'TOKEN=main-secret-value\n' > "$SRC/.env"; printf 'TOKEN=wt-secret-value\n' > "$DST/.env"
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync check"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TOKEN: differs (main 17 chars, worktree 15 chars)"* ]]
+  [[ "$output" == *"--unmask"* ]]                # the hint is there
+  [[ "$output" != *"secret-value"* ]]
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync check --unmask"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"-TOKEN=main-secret-value"* ]]
+  [[ "$output" == *"+TOKEN=wt-secret-value"* ]]
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync check --frob"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected argument"* ]]
+  printf 'TOKEN=main-secret-value\n' > "$DST/.env"   # nothing differs: same output as before
+  run bash -c "cd '$DST' && XDG_CONFIG_HOME='$XDG_CONFIG_HOME' '$GROVE' sync check"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all synced paths match"* ]]
+  cd "$BATS_TEST_TMPDIR"
+  run "$GROVE" rm --unmask --force some-branch    # consumed by the parser, bails later (no wt/cmux/repo)
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"unknown option"* ]]
+  run "$GROVE" rm -h
+  [[ "$output" == *"--unmask"* ]]
 }

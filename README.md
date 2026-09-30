@@ -108,7 +108,7 @@ grove: synced paths differ from the main checkout (above) — copy what you need
 agents are already running:
 
 ```sh
-grove sync                    # copy any missing paths into this worktree
+grove sync                    # fill the gaps in both directions; merge dotenv keys
 grove sync check              # diff against the main checkout (exit 1 if any differ)
 grove sync list               # each path's config + worktree state
 grove sync add [--local] .env # edit .grove.json, so hand-editing the array is optional
@@ -119,7 +119,20 @@ Bare `grove sync` covers the case `grove go` can't: you add `.env` to the main c
 *after* spawning five agents, and the attach gate rightly refuses to re-run `grove go` for
 any of them. `check` exits 1 on divergence, so it composes into scripts and hooks. `add`
 refuses a tracked path outright and warns (but still writes) on one that isn't gitignored
-or doesn't exist yet.
+or exists in neither checkout — and it gap-fills the path it just added, so adding a `.env`
+that already exists here is one command.
+
+`sync` fills gaps in **both** directions, because a path is often *born* on the branch that
+introduces it: missing here is copied from the main checkout, missing there is seeded from
+this worktree. Nothing is ever overwritten — only which side may be the source changed. When
+both sides have a `.env` and they differ, the **keys are merged**: whatever only one side has
+is appended verbatim to the other (each file keeps its own order, comments and quoting), and
+`KEY=foo` / `KEY="foo"` count as the same value. A key both sides define *differently* is a
+conflict — that path is left alone and `grove sync` exits 1 after processing the rest,
+reporting `TOKEN: differs (main 41 chars, worktree 4 chars)`: **the keys, never the values**,
+so syncing on a shared screen can't spray your `.env` across it. `grove sync check` still
+shows the full diff when you ask for it. Files that aren't dotenv-shaped keep the old behaviour: they're reported,
+not touched.
 
 Look at it, decide you don't care, `grove rm -f`. The check is stateless — it compares
 against the main checkout rather than a hash taken at copy time — so a rotated `.env` in
