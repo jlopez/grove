@@ -1833,8 +1833,14 @@ grove_rm() {
         return 0
       fi
     fi
+    # --force: since cmux 0.65, closing a workspace with a running process (a
+    # grove tab always has Claude running) is refused with
+    # `confirmation_required` unless forced. The worktree is already gone, so
+    # the agent has nothing left to work on. Older cmux rejects the unknown
+    # flag, hence the plain-close retry.
     info "closing workspace ${_c_bld}$ws${_c_rst} ($branch$away)…"
-    CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
+    CMUX_QUIET=1 "$CMUX" workspace close "$ws" --force >/dev/null 2>&1 \
+      || CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
       || warn "could not close workspace $ws (already gone?)"
   else
     info "no cmux workspace attached to '$branch'"

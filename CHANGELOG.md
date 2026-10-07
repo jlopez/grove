@@ -134,6 +134,11 @@ All notable changes to grove are documented here. Format follows
 - Homebrew formula and `curl | sh` installer.
 
 ### Fixed
+- **`grove rm` closes the workspace again on cmux ≥ 0.65.** cmux now refuses to
+  close a workspace with a running process (`confirmation_required`) unless passed
+  `--force`, and a grove tab always has Claude running — so the close silently
+  failed with "could not close workspace (already gone?)". grove now closes with
+  `--force`, falling back to a plain close on older cmux.
 - **The env-stamp sweep now finds a tab dragged out of its repo group.** The
   shared matcher's `GROVE_WORKTREE_PATH` fallback (issue #18) swept only the
   repo group's members, so a workspace moved to another group — or to no group —
