@@ -206,7 +206,7 @@ auto-detects it; override with `GROVE_CMUX`). Relevant JSON shapes:
 | `workspace-group list --json` | `{groups: [{ref, name, anchor_workspace_ref, member_workspace_refs, custom_color, icon_symbol}]}` | `.groups[] | select(.name==…) | .ref` |
 | `workspace list --json` | `{window_ref, workspaces: [{ref, title, custom_title, current_directory, …}]}` | member `ref` → `title`, for the attach gate (below) and `grove rm`'s close target |
 | `workspace env <ref> --json` | `{count, env: {KEY: VALUE, …}, window_ref, workspace_ref}` | `.env.GROVE_WORKTREE_PATH`, for the shared matcher's env fallback (issue #18) |
-| `workspace close <ref>` | — | — (`grove rm` closes the branch's tab; closing a *member* keeps the group) |
+| `workspace close <ref> [--force]` | — | — (`grove rm` closes the branch's tab; closing a *member* keeps the group. cmux ≥ 0.65 refuses a tab with a running process — `confirmation_required` — without `--force`; 0.64 accepts and ignores the flag) |
 | `workspace-group add --group <ref> --workspace <ref>` | — | — |
 | `workspace-group set-color <g> --hex #RRGGBB` / `set-icon <g> --symbol <sf>` | — | — (styling; see below) |
 

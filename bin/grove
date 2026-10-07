@@ -1833,9 +1833,19 @@ grove_rm() {
         return 0
       fi
     fi
+    # --force: since cmux 0.65, closing a workspace with a running process (a
+    # grove tab always has Claude running) is refused with
+    # `confirmation_required` unless forced. The worktree is already gone, so
+    # the agent has nothing left to work on. cmux 0.64 accepts (and ignores)
+    # the flag; a cmux old enough to reject it gets the plain-close retry.
+    # When both fail, surface cmux's own error — swallowing it is what hid the
+    # 0.65 refusal behind "(already gone?)" in the first place.
     info "closing workspace ${_c_bld}$ws${_c_rst} ($branch$away)…"
-    CMUX_QUIET=1 "$CMUX" workspace close "$ws" >/dev/null 2>&1 \
-      || warn "could not close workspace $ws (already gone?)"
+    local close_out
+    close_out=$(CMUX_QUIET=1 "$CMUX" workspace close "$ws" --force 2>&1) \
+      || close_out=$(CMUX_QUIET=1 "$CMUX" workspace close "$ws" 2>&1) \
+      || { close_out=${close_out//$'\n'/ }
+           warn "could not close workspace $ws: ${close_out:-no error text from cmux (already gone?)}"; }
   else
     info "no cmux workspace attached to '$branch'"
   fi
