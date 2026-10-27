@@ -257,9 +257,13 @@ close-target lookup):
   Managed via `cmux workspace-group {create,add,remove,new-workspace,set-color,set-icon,
   rename,collapse,expand,pin,ungroup,set-anchor,move,focus,list}`.
 - **The anchor workspace IS the group header.** grove makes the **main checkout** the
-  anchor (so worktrees nest under a stable repo header). `workspace-group create
-  --name <repo> --cwd <main-checkout> --from <ws>` creates a fresh header anchor at
-  `--cwd` and files `--from` as a member.
+  anchor (so worktrees nest under a stable repo header). A fresh group is created
+  **anchor-only** — `workspace-group create --name <repo> --cwd <main-checkout>` (no
+  `--from`) mints a generated header workspace at `--cwd` — and the spawn is then filed
+  with `workspace-group add`. Never `create --from <ws>`: on cmux ≤ 0.64 it filed `<ws>`
+  under a fresh header, but since 0.65 it **promotes `<ws>` to anchor**, so the worktree
+  tab became the header itself and the sidebar showed a group with no child row
+  (issue #47). The two-step form behaves identically on both.
 - **Closing the anchor dissolves the group but preserves members** (they become
   ungrouped). `workspace-group delete` is destructive — it closes every member. Use
   `ungroup` to keep them.

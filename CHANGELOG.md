@@ -6,6 +6,15 @@ All notable changes to grove are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A brand-new repo group lists its first workspace again (cmux ≥ 0.65).** `grove go`
+  into a repo with no cmux group yet created the group with `workspace-group create
+  --from <spawn>`, which on cmux 0.65 *promotes* the spawned workspace to the group's
+  anchor instead of filing it under a fresh header — so the sidebar showed the group
+  header with no child row and the session was only reachable by clicking the header
+  (#47). The group is now created anchor-only (cmux mints the header at the main
+  checkout) and the spawn is `add`ed as a member, matching groups that already exist.
+
 ### Added
 - **`sync.paths` — untracked files carried into worktrees, and guarded on the way
   out.** A new config key (any layer) names repo-relative gitignored paths —
