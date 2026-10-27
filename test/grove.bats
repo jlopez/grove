@@ -2188,7 +2188,8 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
 
 _fake_cmux() {   # $1 = `workspace-group list` reply; $2 = `workspace-group create` reply (optional)
   local bin="$BATS_TEST_TMPDIR/cmux" log="$BATS_TEST_TMPDIR/cmux.log"
-  local created="${2:-{\"created\":true,\"group\":{\"ref\":\"workspace_group:9\",\"anchor_workspace_ref\":\"workspace:90\"}\}}"
+  local created='{"created":true,"group":{"ref":"workspace_group:9","anchor_workspace_ref":"workspace:90"}}'
+  [ $# -ge 2 ] && created="$2"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\ncase "$1 $2" in\n' "$log" > "$bin"
   printf '  "workspace-group list") printf %%s %q ;;\n' "$1" >> "$bin"
   printf '  "workspace-group create") printf %%s %q ;;\n' "$created" >> "$bin"
