@@ -2186,12 +2186,12 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
 # on cmux >= 0.65 `--from` promotes the spawn to anchor and the sidebar shows a
 # header with no child row) and the spawn then filed with `add`.
 
-_fake_cmux() {   # $1 = groups JSON returned by `workspace-group list`
+_fake_cmux() {   # $1 = `workspace-group list` reply; $2 = `workspace-group create` reply (optional)
   local bin="$BATS_TEST_TMPDIR/cmux" log="$BATS_TEST_TMPDIR/cmux.log"
+  local created="${2:-{\"created\":true,\"group\":{\"ref\":\"workspace_group:9\",\"anchor_workspace_ref\":\"workspace:90\"}\}}"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\ncase "$1 $2" in\n' "$log" > "$bin"
   printf '  "workspace-group list") printf %%s %q ;;\n' "$1" >> "$bin"
-  printf '  "workspace-group create") echo %s ;;\n' \
-    "'{\"created\":true,\"group\":{\"ref\":\"workspace_group:9\",\"anchor_workspace_ref\":\"workspace:90\"}}'" >> "$bin"
+  printf '  "workspace-group create") printf %%s %q ;;\n' "$created" >> "$bin"
   printf '  *) ;;\nesac\n' >> "$bin"
   chmod +x "$bin"; : > "$log"
 }
@@ -2221,8 +2221,7 @@ _fake_cmux() {   # $1 = groups JSON returned by `workspace-group list`
 }
 
 @test "ensure_group: create yielding no ref fails without attempting an add" {
-  _fake_cmux '{"groups":[]}'
-  sed -i '' 's/"workspace-group create") echo .*/"workspace-group create") echo "{}" ;;/' "$BATS_TEST_TMPDIR/cmux"
+  _fake_cmux '{"groups":[]}' '{}'
   source "$GROVE"
   run grove_ensure_group "$BATS_TEST_TMPDIR/cmux" grove /repos/grove workspace:42
   [ "$status" -eq 1 ]
