@@ -1391,6 +1391,30 @@ grove_adopt_orphans() {
   done < <(grove_orphan_candidates "$groups" "$workspaces")
 }
 
+# grove_ensure_group <cmux> <repo> <repo-path> <ws> — file workspace <ws> under
+# the cmux group named <repo>, creating the group on first use, and print the
+# group ref (exit 1 when neither path yields a group). A fresh group is created
+# **anchor-only** (`create --name --cwd`, no `--from`), which makes cmux mint a
+# header workspace at the main checkout, and <ws> is then `add`ed as a member.
+# Not `create --from <ws>`: since cmux 0.65 `--from` *promotes* the listed
+# workspace to anchor instead of filing it under a fresh header, so the spawned
+# worktree tab became the group header itself and the sidebar showed a group
+# with no child row (issue #47). The two-step form behaves the same on both.
+grove_ensure_group() {
+  local cmux="$1" repo="$2" repo_path="$3" ws="$4" gid
+  gid=$(CMUX_QUIET=1 "$cmux" workspace-group list --json 2>/dev/null \
+        | jq -r --arg n "$repo" 'first((.groups // [])[] | select(.name==$n) | .ref) // empty')
+  if [ -z "$gid" ]; then
+    gid=$(CMUX_QUIET=1 "$cmux" workspace-group create \
+            --name "$repo" --cwd "$repo_path" --json 2>/dev/null \
+          | jq -r '.group.ref // empty')
+    { [ -n "$gid" ] && [ "$gid" != "null" ]; } || return 1
+  fi
+  CMUX_QUIET=1 "$cmux" workspace-group add --group "$gid" --workspace "$ws" >/dev/null 2>&1 \
+    || warn "could not file $ws under group '$repo'"
+  printf '%s\n' "$gid"
+}
+
 # grove_group_ref <groups-json> <repo> — print the ref of the cmux group named
 # <repo>, or nothing. Pure (jq only); missing/misshapen keys fail closed to "".
 grove_group_ref() {
@@ -1612,14 +1636,7 @@ grove_go() {
 
   # 7. File under the repo group; create it (anchor = main checkout) on first use.
   local gid
-  gid=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json \
-        | jq -r --arg n "$REPO" 'first(.groups[] | select(.name==$n) | .ref) // empty')
-  if [ -n "$gid" ]; then
-    CMUX_QUIET=1 "$CMUX" workspace-group add --group "$gid" --workspace "$ws" >/dev/null
-  else
-    gid=$(CMUX_QUIET=1 "$CMUX" workspace-group create \
-            --name "$REPO" --cwd "$REPO_PATH" --from "$ws" --json | jq -r '.group.ref')
-  fi
+  gid=$(grove_ensure_group "$CMUX" "$REPO" "$REPO_PATH" "$ws") || gid=""
 
   # 8. Adopt orphans (issue #23): if this repo's group was dissolved (anchor tab
   #    closed), its surviving workspaces are ungrouped and invisible to the

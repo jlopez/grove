@@ -2178,3 +2178,55 @@ _pair_paths() {   # reconfigure the fixture's sync.paths without rebuilding it
   [ ! -e "$STUB/deleted" ]         # nothing recreated the dead path
   [ ! -f "$STUB/adds.log" ]        # cmux never touched
 }
+
+# --- group creation on first use (issue #47) ----------------------------------
+# grove_ensure_group drives cmux through a fake binary that records every call
+# and answers list/create with canned JSON, so the exact create+add sequence
+# is pinned without cmux: the group must be created anchor-only (no --from —
+# on cmux >= 0.65 `--from` promotes the spawn to anchor and the sidebar shows a
+# header with no child row) and the spawn then filed with `add`.
+
+_fake_cmux() {   # $1 = `workspace-group list` reply; $2 = `workspace-group create` reply (optional)
+  local bin="$BATS_TEST_TMPDIR/cmux" log="$BATS_TEST_TMPDIR/cmux.log"
+  local created='{"created":true,"group":{"ref":"workspace_group:9","anchor_workspace_ref":"workspace:90"}}'
+  [ $# -ge 2 ] && created="$2"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\ncase "$1 $2" in\n' "$log" > "$bin"
+  printf '  "workspace-group list") printf %%s %q ;;\n' "$1" >> "$bin"
+  printf '  "workspace-group create") printf %%s %q ;;\n' "$created" >> "$bin"
+  printf '  *) ;;\nesac\n' >> "$bin"
+  chmod +x "$bin"; : > "$log"
+}
+
+@test "ensure_group: first use creates an anchor-only group (no --from), then adds the spawn" {
+  _fake_cmux '{"groups":[]}'
+  source "$GROVE"
+  run grove_ensure_group "$BATS_TEST_TMPDIR/cmux" grove /repos/grove workspace:42
+  [ "$status" -eq 0 ]
+  [ "$output" = "workspace_group:9" ]
+  run cat "$BATS_TEST_TMPDIR/cmux.log"
+  [ "${lines[0]}" = "workspace-group list --json" ]
+  [ "${lines[1]}" = "workspace-group create --name grove --cwd /repos/grove --json" ]
+  [ "${lines[2]}" = "workspace-group add --group workspace_group:9 --workspace workspace:42" ]
+  [ "${#lines[@]}" -eq 3 ]
+}
+
+@test "ensure_group: existing group is reused — no create, add to its ref" {
+  _fake_cmux '{"groups":[{"name":"grove","ref":"workspace_group:3"},{"name":"other","ref":"workspace_group:4"}]}'
+  source "$GROVE"
+  run grove_ensure_group "$BATS_TEST_TMPDIR/cmux" grove /repos/grove workspace:42
+  [ "$status" -eq 0 ]
+  [ "$output" = "workspace_group:3" ]
+  run cat "$BATS_TEST_TMPDIR/cmux.log"
+  [ "${lines[1]}" = "workspace-group add --group workspace_group:3 --workspace workspace:42" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "ensure_group: create yielding no ref fails without attempting an add" {
+  _fake_cmux '{"groups":[]}' '{}'
+  source "$GROVE"
+  run grove_ensure_group "$BATS_TEST_TMPDIR/cmux" grove /repos/grove workspace:42
+  [ "$status" -eq 1 ]
+  [ -z "$output" ]
+  run grep -c 'workspace-group add' "$BATS_TEST_TMPDIR/cmux.log"
+  [ "$output" = "0" ]
+}
