@@ -7,6 +7,26 @@ All notable changes to grove are documented here. Format follows
 ## [Unreleased]
 
 ### Fixed
+- **`grove rm` no longer half-reaps a room that switched branches.** A room whose agent
+  checked out another branch inside its worktree (stacked PRs, testing a sibling) was
+  invisible to `grove rm <branch>`, which looked the worktree up by checked-out branch:
+  it printed `no worktree`, closed the tab anyway, and left the worktree and both local
+  branches behind (#49). `grove rm` now resolves the worktree from grove's own record of
+  the room first — the `GROVE_WORKTREE_PATH` stamp on the tab titled `<branch>` (or, for an
+  unstamped tab, the worktree containing its cwd) — and falls back to `wt list` only without
+  one. When no worktree is found, the tab is **left open** and the command exits 1 with the
+  tab's recorded path and a `--path` hint (a record naming a worktree that is already gone
+  still closes its orphan tab). A switched room is removed by path, and both branches are
+  settled: the checked-out one by `wt remove`'s merged-only rule, the room branch by grove
+  under a mirror of that rule — deleted only when merged into the default branch
+  (squash-aware) or pushed to `origin/<branch>`, kept with the exact `git branch -D`
+  otherwise, never when it is the default branch or checked out elsewhere; `-D` and
+  `--keep-branch` apply to both. New **`grove rm --path <worktree>`** names the worktree
+  directly, and a bare `grove rm` now resolves the current worktree by path. A
+  title-matched tab stamped for another live worktree is never closed. `grove rm` typed
+  with the checked-out branch instead of the room name also settles the room's branch
+  (merged/pushed only), and closing an orphan tab whose room branch is still unmerged
+  warns first (a moved worktree reads as gone; use `--path`).
 - **A brand-new repo group lists its first workspace again (cmux ≥ 0.65).** `grove go`
   into a repo with no cmux group yet created the group with `workspace-group create
   --from <spawn>`, which on cmux 0.65 *promotes* the spawned workspace to the group's

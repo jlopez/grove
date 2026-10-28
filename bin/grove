@@ -1655,8 +1655,244 @@ grove_go() {
   printf '%s\n' "$wtpath"
 }
 
+# ---- grove rm: resolving the room's worktree (issue #49) --------------------
+# A "room" is a grove workspace: the cmux tab `grove go <branch>` opened, titled
+# <branch> and stamped GROVE_WORKTREE_PATH=<worktree>. The branch is only the
+# room's *name*: an agent can check out another branch inside its worktree
+# (stacked PRs, testing a sibling), and `wt list` — keyed by the branch each
+# worktree has checked out NOW — then no longer finds the room under its name.
+# Pre-#49 `grove rm` trusted that lookup alone, so a switched room was reaped
+# half-way: "no worktree" yet the tab closed, the worktree and both branches
+# left behind. The helpers below resolve the worktree from grove's own record
+# of the room first, and let `wt list` only fill in when there is no record.
+
+# grove_worktree_entries <repo-dir> — print every worktree git has registered
+# for the repo, one canonical (`pwd -P`) path per line; line 1 is the primary
+# checkout (git lists it first). A registered-but-missing worktree (prunable)
+# can't be canonicalized and is printed as git stores it. Paths are compared
+# canonicalized because the stamp, cmux's cwd and git may each spell a symlinked
+# location differently (/tmp vs /private/tmp on macOS).
+grove_worktree_entries() {
+  local line p
+  git -C "$1" worktree list --porcelain 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) p=${line#worktree }
+                    (cd "$p" 2>/dev/null && pwd -P) || printf '%s\n' "$p" ;;
+    esac
+  done
+}
+
+# grove_canon <path> — the canonical form of <path> if it exists, else <path>.
+grove_canon() {
+  (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# grove_linked_worktree <repo-dir> <path> — print <path>'s canonical form and
+# exit 0 iff it is a registered LINKED worktree of the repo whose directory
+# exists (never the primary checkout: `grove rm` must not tear down the group's
+# anchor; never a prunable entry: there is nothing on disk to remove). Exact
+# root match: a directory inside a worktree is not the worktree.
+grove_linked_worktree() {
+  local canon entries
+  [ -n "$2" ] && [ -d "$2" ] || return 1
+  canon=$(grove_canon "$2")
+  # Collect first, then match: `grep -q` exits on the first hit, and under
+  # pipefail the writer's SIGPIPE would turn a match into a failure.
+  entries=$(grove_worktree_entries "$1" | tail -n +2)
+  grep -Fxq -- "$canon" <<<"$entries" || return 1
+  printf '%s\n' "$canon"
+}
+
+# grove_registered_worktree <repo-dir> <path> — exit 0 iff <path> is ANY
+# registered worktree of the repo, primary included.
+grove_registered_worktree() {
+  [ -n "$2" ] || return 1
+  local entries; entries=$(grove_worktree_entries "$1")
+  grep -Fxq -- "$(grove_canon "$2")" <<<"$entries"
+}
+
+# grove_ws_field <workspaces-json> <ref> <field> — print one string field of
+# workspace <ref> from a `workspace list --json` listing, or nothing. Pure.
+grove_ws_field() {
+  printf '%s' "$1" | jq -r --arg r "$2" --arg f "$3" \
+    'first((.workspaces // [])[] | select(.ref==$r) | .[$f] // empty) // empty' 2>/dev/null
+}
+
+# grove_ws_stamp <cmux> <ref> — print workspace <ref>'s GROVE_WORKTREE_PATH
+# stamp, or nothing (unstamped, or the env read failed).
+grove_ws_stamp() {
+  CMUX_QUIET=1 "$1" workspace env "$2" --json 2>/dev/null </dev/null \
+    | jq -r '.env.GROVE_WORKTREE_PATH // empty' 2>/dev/null || true
+}
+
+# grove_room_record <cmux> <groups-json> <workspaces-json> <repo> <branch> —
+# grove's record of the room named <branch>: print "ref<TAB>kind<TAB>path" for
+# the workspace titled <branch> in the repo group, or nothing when no tab has
+# that title. kind is `env` (path = its GROVE_WORKTREE_PATH stamp — the path
+# `grove go` spawned it with, the authoritative record), `cwd` (no stamp —
+# legacy/adopted tab — so path = its current_directory, a weaker hint), or
+# `none` (neither). Title-matched, group-scoped (grove_ref_in_group): the title
+# is the room's name, which the branch switch doesn't touch.
+grove_room_record() {
+  local cmux="$1" groups="$2" workspaces="$3" repo="$4" branch="$5" ref p
+  ref=$(grove_ref_in_group "$groups" "$workspaces" "$repo" "$branch")
+  [ -n "$ref" ] || return 0
+  p=$(grove_ws_stamp "$cmux" "$ref")
+  if [ -n "$p" ]; then printf '%s\tenv\t%s\n' "$ref" "$p"; return 0; fi
+  p=$(grove_ws_field "$workspaces" "$ref" current_directory)
+  if [ -n "$p" ]; then printf '%s\tcwd\t%s\n' "$ref" "$p"; return 0; fi
+  printf '%s\tnone\t\n' "$ref"
+}
+
+# grove_resolve_room_path <repo-dir> <record-kind> <record-path> <wtlist-path>
+# — decide which worktree `grove rm` tears down; print "source<TAB>path":
+#   record  the stamped path is a registered linked worktree → it (issue #49:
+#           the record beats `wt list`, which keys on the checked-out branch)
+#   cwd     no stamp, but the tab's cwd lies in a registered linked worktree →
+#           that worktree's root (an agent may have cd'd into a subdirectory)
+#   wtlist  no usable record → `wt list`'s path for the branch (pre-#49 lookup)
+#   gone    the record names a path that neither exists nor is registered: the
+#           worktree is already removed (`wt merge`, a manual `git worktree
+#           remove`), so the tab is an orphan and closing it is the right call
+#   none    nothing found — the caller must NOT close any tab
+# Only the filesystem and git are consulted (no cmux), so bats tests it against
+# real throwaway repos.
+grove_resolve_room_path() {
+  local repo="$1" kind="$2" rec="$3" wl="$4" p top
+  if [ "$kind" = env ] && p=$(grove_linked_worktree "$repo" "$rec"); then
+    printf 'record\t%s\n' "$p"; return 0
+  fi
+  if [ "$kind" = cwd ] && [ -d "$rec" ]; then
+    top=$(git -C "$rec" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -n "$top" ] && p=$(grove_linked_worktree "$repo" "$top"); then
+      printf 'cwd\t%s\n' "$p"; return 0
+    fi
+  fi
+  if [ -n "$wl" ]; then
+    printf 'wtlist\t%s\n' "$(grove_canon "$wl")"; return 0
+  fi
+  if { [ "$kind" = env ] || [ "$kind" = cwd ]; } && [ -n "$rec" ] \
+     && [ ! -e "$rec" ] && ! grove_registered_worktree "$repo" "$rec"; then
+    printf 'gone\t%s\n' "$rec"; return 0
+  fi
+  printf 'none\t\n'
+}
+
+# grove_default_branch — the repo's default branch: origin/HEAD, else
+# worktrunk's own notion (`wt config state default-branch`), else a local
+# main/master. Empty when none can be told.
+grove_default_branch() {
+  local d
+  d=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null) || d=""
+  d=${d#origin/}
+  [ -n "$d" ] && [ "$d" != HEAD ] && { printf '%s\n' "$d"; return 0; }
+  d=$(wt config state default-branch 2>/dev/null) || d=""
+  if [ -n "$d" ] && git show-ref --verify --quiet "refs/heads/$d"; then
+    printf '%s\n' "$d"; return 0
+  fi
+  for d in main master; do
+    git show-ref --verify --quiet "refs/heads/$d" && { printf '%s\n' "$d"; return 0; }
+  done
+  return 0
+}
+
+# grove_branch_disposable <repo-dir> <branch> <default> — exit 0 iff deleting
+# local <branch> loses nothing, printing why; exit 1 (silent) otherwise. Used
+# for the ROOM branch of a switched room, which `wt remove <path>` never sees
+# (it only cleans up the branch checked out in the worktree), so grove mirrors
+# wt's own rule for it rather than invent a laxer one:
+#   - pushed: the tip is contained in origin/<branch> (as last fetched) — every
+#     commit already lives on the remote;
+#   - merged: wt's six "adds nothing to the default branch" checks, in its
+#     order — same commit, ancestor, empty three-dot diff, tree match,
+#     simulated merge adds nothing (squash merge, target moved on elsewhere),
+#     patch-id equal to one commit on the target (squash merge, target later
+#     touched the same files) — against the local default branch and
+#     origin/<default>, either one sufficing (wt picks the upstream only when
+#     it is strictly ahead; both are "in main"). The patch-id walk is capped at
+#     500 commits, as wt caps its own.
+grove_branch_disposable() {
+  local repo="$1" b="$2" def="$3" tip t tt mb pid pids mt
+  tip=$(git -C "$repo" rev-parse --verify --quiet "refs/heads/$b^{commit}") || return 1
+  if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$b" \
+     && git -C "$repo" merge-base --is-ancestor "$tip" "refs/remotes/origin/$b" 2>/dev/null; then
+    printf 'pushed to origin/%s\n' "$b"; return 0
+  fi
+  [ -n "$def" ] || return 1
+  for t in "refs/heads/$def" "refs/remotes/origin/$def"; do
+    git -C "$repo" show-ref --verify --quiet "$t" || continue
+    local name=${t#refs/heads/}; name=${name#refs/remotes/}
+    [ "$(git -C "$repo" rev-parse "$t")" = "$tip" ] \
+      && { printf 'same commit as %s\n' "$name"; return 0; }
+    git -C "$repo" merge-base --is-ancestor "$tip" "$t" 2>/dev/null \
+      && { printf 'ancestor of %s\n' "$name"; return 0; }
+    git -C "$repo" diff --quiet "$t...$tip" 2>/dev/null \
+      && { printf 'no changes beyond %s\n' "$name"; return 0; }
+    tt=$(git -C "$repo" rev-parse "$t^{tree}")
+    [ "$(git -C "$repo" rev-parse "$tip^{tree}")" = "$tt" ] \
+      && { printf 'tree matches %s\n' "$name"; return 0; }
+    mt=$(git -C "$repo" merge-tree --write-tree "$t" "$tip" 2>/dev/null) || mt=""
+    [ -n "$mt" ] && [ "${mt%%$'\n'*}" = "$tt" ] \
+      && { printf 'merging into %s adds nothing\n' "$name"; return 0; }
+    mb=$(git -C "$repo" merge-base "$t" "$tip" 2>/dev/null) || continue
+    pid=$(git -C "$repo" diff "$mb" "$tip" | git -C "$repo" patch-id --stable | cut -d' ' -f1)
+    [ -n "$pid" ] || continue
+    pids=$(git -C "$repo" log -p --no-merges -n 500 "$mb..$t" 2>/dev/null \
+             | git -C "$repo" patch-id --stable | cut -d' ' -f1)
+    grep -Fxq -- "$pid" <<<"$pids" \
+      && { printf 'squash-merged into %s\n' "$name"; return 0; }
+  done
+  return 1
+}
+
+# grove_branch_checked_out <repo-dir> <branch> — print the worktree that has
+# <branch> checked out (exit 0), or nothing (exit 1).
+grove_branch_checked_out() {
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk -v want="branch refs/heads/$2" '
+    /^worktree / { wt = substr($0, 10) }
+    $0 == want   { print wt; found = 1; exit }
+    END          { exit !found }'
+}
+
+# grove_reap_room_branch <repo-dir> <branch> <default> <force-delete> <keep> —
+# after a switched room's worktree is gone, decide the fate of the room branch
+# (no longer checked out there, so `wt remove` didn't touch it). Never deletes
+# the default branch or a branch checked out in another worktree; --keep-branch
+# keeps it; -D deletes it regardless; otherwise it goes only when disposable
+# (grove_branch_disposable) — an unmerged, unpushed branch is kept and the exact
+# command to delete it is printed. Always returns 0: by now the worktree is
+# removed, and a kept branch is the safe outcome, not a failure.
+grove_reap_room_branch() {
+  local repo="$1" b="$2" def="$3" forcedel="$4" keep="$5" why other
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$b"; then
+    info "room branch '$b': no local branch left to delete"; return 0
+  fi
+  if [ -n "$keep" ]; then
+    info "room branch '$b': kept (--keep-branch)"; return 0
+  fi
+  if [ -n "$def" ] && [ "$b" = "$def" ]; then
+    warn "room branch '$b': kept (it is the default branch)"; return 0
+  fi
+  if other=$(grove_branch_checked_out "$repo" "$b"); then
+    warn "room branch '$b': kept (checked out in $other)"; return 0
+  fi
+  if [ -n "$forcedel" ]; then
+    why="-D"
+  elif ! why=$(grove_branch_disposable "$repo" "$b" "$def"); then
+    warn "room branch '$b': kept — it has commits in neither ${def:-the default branch} nor origin/$b"
+    warn "delete it anyway with: git branch -D $b"
+    return 0
+  fi
+  if git -C "$repo" branch -D "$b" >/dev/null 2>&1; then
+    info "room branch '$b': deleted ($why)"
+  else
+    warn "room branch '$b': could not delete it — run: git branch -D $b"
+  fi
+}
+
 # =============================================================================
-# grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+# grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch]
+#          [--path <worktree>] [<branch>]
 # The inverse of `grove go`: close the cmux workspace attached to <branch> and
 # remove its worktree. grove owns the workspace↔branch bridge (nobody else knows
 # it), so it closes the tab `wt remove`/`wt merge` would otherwise strand; the
@@ -1665,9 +1901,19 @@ grove_go() {
 # (six conditions incl. simulated merge + patch-id), superseding issue #15's
 # proposed gh-PR-state guard; see "safety model" in docs/design.md. An unmerged
 # branch is kept, never deleted, unless -D.
+#
+# The worktree is found by grove's own record of the room first — the
+# GROVE_WORKTREE_PATH stamp on the tab titled <branch> — and only then by
+# `wt list` (issue #49: a room that checked out another branch is invisible to
+# a lookup keyed on the checked-out branch). When nothing is found the tab is
+# left open: closing it would strand the worktree it still points at. A room
+# whose worktree has another branch checked out is removed by PATH, and both
+# branches go through a merged/pushed guard. --path <worktree> names the
+# worktree directly when nothing else can.
 # =============================================================================
 grove_rm() {
   local opt_force="" opt_unmask="" opt_forcedel="" opt_keep="" opt_reap="" opt_no_fetch="" branch=""
+  local opt_path="" path_set=""
   # Unlike `grove go` (whose trailing tokens are the prompt), `grove rm` has no
   # free-form tail — so flags may appear in any position and a second positional
   # is a mistake we reject, rather than silently dropping a post-branch --force
@@ -1680,7 +1926,13 @@ grove_rm() {
       --keep-branch)      opt_keep=1; shift ;;
       --reap)             opt_reap=1; shift ;;
       --no-fetch)         opt_no_fetch=1; shift ;;
-      -h|--help)          echo "usage: grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]"; return 0 ;;
+      --path)             { [ $# -ge 2 ] && [ -n "$2" ]; } \
+                            || die "grove rm: --path needs a worktree directory"
+                          opt_path="$2"; path_set=1; shift 2 ;;
+      --path=*)           opt_path="${1#--path=}"
+                          [ -n "$opt_path" ] || die "grove rm: --path needs a worktree directory"
+                          path_set=1; shift ;;
+      -h|--help)          echo "usage: grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [--path <worktree>] [<branch>]"; return 0 ;;
       --)            shift
                      while [ $# -gt 0 ]; do
                        [ -z "$branch" ] || die "grove rm: unexpected argument '$1'"
@@ -1697,28 +1949,124 @@ grove_rm() {
   local CMUX; CMUX=$(grove_cmux) || die "cmux CLI not found — see 'grove doctor'"
 
   grove_repo_identity
+  local canon_repo; canon_repo=$(grove_canon "$REPO_PATH")
 
-  # Default to the current worktree's branch (matches `wt remove`'s "current"
-  # default) — so `grove rm` from inside the worktree you're done with just works.
-  if [ -z "$branch" ]; then
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
-    { [ -n "$branch" ] && [ "$branch" != "HEAD" ]; } \
-      || die "grove rm: no <branch> given and couldn't detect the current branch"
+  # The cmux listings, read once up front: the room record (which worktree to
+  # remove) and the tab close at the end both need them, and removing a
+  # worktree changes nothing cmux reports.
+  local groups workspaces groups_ok=1
+  groups=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json 2>/dev/null) \
+    || { groups='{}'; groups_ok=0; }
+  workspaces=$(CMUX_QUIET=1 "$CMUX" workspace list --json 2>/dev/null)   || workspaces='{}'
+
+  # No <branch> and no --path: the room you're standing in (matches
+  # `wt remove`'s "current" default), so `grove rm` from inside the worktree
+  # you're done with just works. It is resolved by this worktree's PATH, not by
+  # its checked-out branch — the branch may no longer be the room's (#49).
+  local implicit=""
+  if [ -z "$branch" ] && [ -z "$path_set" ]; then
+    opt_path=$WORKTREE_ROOT; path_set=1; implicit=1
   fi
 
-  # Primary-checkout guard: never tear down the repo's main checkout (the group's
-  # anchor/header). Compare canonicalized paths, as `grove go` does. Removing a
-  # *member* leaves the group intact; only closing the anchor dissolves it.
-  # canon_wt outlives this guard: it's the env-fallback match key for the tab
-  # close below, and must be canonicalized NOW — `wt remove` deletes the dir.
-  local wtpath canon_wt="" canon_repo
-  wtpath=$(grove_worktree_path "$branch") \
-    || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
-  if [ -n "$wtpath" ]; then
-    canon_wt=$(cd "$wtpath" 2>/dev/null && pwd -P) || canon_wt="$wtpath"
-    canon_repo=$(cd "$REPO_PATH" 2>/dev/null && pwd -P) || canon_repo="$REPO_PATH"
+  # Resolve the worktree. canon_wt outlives this step: it's the env-fallback
+  # match key for the tab close below, and must be canonicalized NOW —
+  # `wt remove` deletes the dir.
+  local canon_wt="" src="" rec_ref="" rec_kind="" rec_path=""
+  if [ -n "$path_set" ]; then
+    # Primary-checkout guard (path form): never tear down the repo's main
+    # checkout (the group's anchor/header).
+    if [ "$(grove_canon "$opt_path")" = "$canon_repo" ]; then
+      local what="'$opt_path'"
+      [ -n "$implicit" ] && what="'$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$opt_path")'"
+      die "$what is the repo's primary checkout — grove rm targets linked worktrees"
+    fi
+    canon_wt=$(grove_linked_worktree "$REPO_PATH" "$opt_path") \
+      || die "'$opt_path' is not a linked worktree of $REPO (see 'git worktree list')"
+    src=path
+    # The room's name, when not given: the title of the tab stamped with this
+    # worktree, else the branch checked out in it.
+    if [ -z "$branch" ]; then
+      local pref; pref=$(grove_env_ref_sweep "$CMUX" "$groups" "$workspaces" "$REPO" "$canon_wt")
+      [ -z "$pref" ] || branch=$(grove_ws_field "$workspaces" "$pref" title)
+      if [ -z "$branch" ]; then
+        branch=$(git -C "$canon_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+        [ "$branch" != HEAD ] || branch=""
+      fi
+    fi
+  else
+    # Record first, `wt list` second (#49). The record is the GROVE_WORKTREE_PATH
+    # stamp on the tab titled <branch> (grove_room_record); `wt list` keys on the
+    # branch each worktree has checked out NOW, which a room can change.
+    local wl rec res
+    wl=$(grove_worktree_path "$branch") \
+      || die "could not query worktrees (is 'wt' working? see 'grove doctor')"
+    rec=$(grove_room_record "$CMUX" "$groups" "$workspaces" "$REPO" "$branch")
+    [ -z "$rec" ] || IFS=$'\t' read -r rec_ref rec_kind rec_path <<<"$rec"
+    res=$(grove_resolve_room_path "$REPO_PATH" "$rec_kind" "$rec_path" "$wl")
+    src=${res%%$'\t'*}
+    case "$src" in
+      record|cwd)
+        canon_wt=${res#*$'\t'}
+        if [ -z "$wl" ] || [ "$(grove_canon "$wl")" != "$canon_wt" ]; then
+          info "worktree for '$branch' resolved from workspace $rec_ref's record: $canon_wt (wt list: ${wl:-no worktree on that branch})"
+        fi ;;
+      wtlist)
+        canon_wt=${res#*$'\t'} ;;
+      gone)
+        # The record names a worktree that no longer exists anywhere (removed
+        # by `wt merge` or by hand): the tab is an orphan — closing it is the
+        # one close that needs no worktree.
+        info "worktree for '$branch' already gone ($rec_path) — closing its orphaned workspace"
+        # A worktree that was MOVED (git worktree move) and then switched
+        # branches also lands here — its stamp no longer exists — so an
+        # unmerged room branch left behind is worth a pointer before the tab
+        # (the only thing still naming the room) goes.
+        if git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$branch" \
+           && ! grove_branch_disposable "$REPO_PATH" "$branch" "$(grove_default_branch)" >/dev/null; then
+          warn "room branch '$branch' still exists and is not merged — it was left behind"
+          warn "if its worktree was moved, remove it with: grove rm --path <worktree> $branch"
+        fi ;;
+      *)
+        # Nothing found. Never close the tab here: it may still point at a
+        # worktree grove failed to see, and closing it would strand that
+        # worktree out of sight (the #49 half-reap).
+        if [ -n "$rec_ref" ]; then
+          err "no worktree for '$branch' — leaving workspace $rec_ref open"
+          if [ -n "$rec_path" ] && [ ! -e "$rec_path" ]; then
+            err "git still registers its recorded path $rec_path, but the directory is gone"
+            err "run 'git worktree prune', then re-run 'grove rm $branch' to close the tab"
+          elif [ -n "$rec_path" ]; then
+            err "its recorded path ($rec_kind): $rec_path is not a linked worktree of $REPO"
+          fi
+          err "point grove at the worktree: grove rm --path <worktree> $branch"
+          exit 1
+        fi
+        info "no worktree for '$branch'"
+        info "no cmux workspace attached to '$branch'"
+        return 0 ;;
+    esac
+  fi
+  local label=${branch:-$canon_wt}
+
+  # Primary-checkout guard: never tear down the repo's main checkout (the
+  # group's anchor/header). Compare canonicalized paths, as `grove go` does.
+  # Removing a *member* leaves the group intact; only closing the anchor
+  # dissolves it. (The record and --path rungs only ever accept linked
+  # worktrees; `wt list` can hand back the primary.)
+  if [ -n "$canon_wt" ]; then
     [ "$canon_wt" != "$canon_repo" ] \
-      || die "'$branch' is the repo's primary checkout — grove rm targets linked worktrees"
+      || die "'$label' is the repo's primary checkout — grove rm targets linked worktrees"
+  fi
+
+  # Has the room switched branches? Then `wt remove` goes by PATH (it cleans up
+  # the branch checked out there, merged-only) and grove itself settles the
+  # room branch afterwards (grove_reap_room_branch) — #49 point 3.
+  local checked="" switched="" def_branch=""
+  if [ -n "$canon_wt" ]; then
+    checked=$(git -C "$canon_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || checked=""
+    # Read now: after `wt remove`, grove's own cwd may be the deleted worktree.
+    def_branch=$(grove_default_branch)
+    [ -n "$branch" ] && [ "$checked" = "$branch" ] || switched=1
   fi
 
   # 0. Synced-path guard (sync.paths). The worktree is about to be deleted and
@@ -1731,15 +2079,15 @@ grove_rm() {
   #    when the judgement needs it. --force doesn't silence the finding, it
   #    just downgrades it to a one-line warning (unless --unmask asked for the
   #    diff): the removal is still discarding content that exists nowhere else.
-  if [ -n "$wtpath" ]; then
+  if [ -n "$canon_wt" ]; then
     # Candidates come from every root that could name one: the worktree grove
     # was invoked from, the worktree being torn down (a branch may have added a
     # path that isn't merged yet), and the main checkout (the only place the
     # gitignored .grove.local.json can live). Union, never a choice — see
     # grove_sync_resolve_paths for why the guard is monotone.
     grove_config_load "$WORKTREE_ROOT"
-    grove_sync_resolve_paths "$WORKTREE_ROOT" "$wtpath" "$canon_repo"
-    if ! grove_sync_check "$canon_repo" "$wtpath" "$opt_force" "$opt_unmask"; then
+    grove_sync_resolve_paths "$WORKTREE_ROOT" "$canon_wt" "$canon_repo"
+    if ! grove_sync_check "$canon_repo" "$canon_wt" "$opt_force" "$opt_unmask"; then
       [ -n "$opt_force" ] \
         || die "synced paths differ from the main checkout (above) — copy what you need, then re-run 'grove rm --force' (--unmask shows the values)"
       warn "--force: removing anyway — the divergence above is discarded"
@@ -1756,7 +2104,7 @@ grove_rm() {
   #    dirty-tree refusal — is known. `-y` skips worktrunk's hook-approval prompts
   #    (as `grove go` does on `wt switch`), so a repo with pre-remove hooks doesn't
   #    hang non-interactively.
-  if [ -n "$wtpath" ]; then
+  if [ -n "$canon_wt" ]; then
     # Freshness — the teardown mirror of issue #14: wt deletes the branch only
     # when its merged-checks say it adds nothing to the default branch, compared
     # against origin/<default> *as last fetched*. Run right after a squash merge
@@ -1773,17 +2121,48 @@ grove_rm() {
           || warn "could not fetch origin/$def — merged-branch detection may be stale"
       fi
     fi
+    # Same branch → `wt remove <branch>`, exactly as before #49. Switched room →
+    # `wt remove <path>`: wt resolves the worktree itself and applies the same
+    # dirty-tree refusal and merged-only deletion to the branch checked out there.
     local rm_args=("$branch" -y)
+    [ -z "$switched" ]     || rm_args=("$canon_wt" -y)
     [ -n "$opt_force" ]    && rm_args+=(--force)
-    [ -n "$opt_forcedel" ] && rm_args+=(--force-delete)
-    [ -n "$opt_keep" ]     && rm_args+=(--no-delete-branch)
+    # Never let wt delete the default branch, should a room have checked it out.
+    # That protection outranks -D: wt rejects --force-delete together with
+    # --no-delete-branch, so -D is dropped from wt's flags (it still applies
+    # to the room branch, which grove settles itself below).
+    if [ -n "$opt_keep" ] || { [ -n "$switched" ] && [ -n "$def_branch" ] && [ "$checked" = "$def_branch" ]; }; then
+      rm_args+=(--no-delete-branch)
+    else
+      [ -n "$opt_forcedel" ] && rm_args+=(--force-delete)
+    fi
     [ -n "$opt_reap" ]     && rm_args+=(--reap)
-    info "removing worktree for '$branch'…"
+    if [ -n "$switched" ]; then
+      local now="'$checked'"
+      case "$checked" in HEAD) now="a detached HEAD" ;; "") now="no readable HEAD" ;; esac
+      info "worktree $canon_wt (room '${branch:-?}') has $now checked out — removing it by path…"
+    else
+      info "removing worktree for '$branch'…"
+    fi
     wt remove "${rm_args[@]}" \
-      || die "worktree removal failed for '$branch' (dirty tree? re-run 'grove rm --force')"
-    info "removed worktree for ${_c_bld}$branch${_c_rst}"
-  else
-    info "no worktree for '$branch'"
+      || die "worktree removal failed for '$label' (dirty tree? re-run 'grove rm --force')"
+    info "removed worktree for ${_c_bld}$label${_c_rst}"
+    # Report both branches of a switched room — what wt did with the checked-out
+    # one, then grove's own verdict on the room branch.
+    if [ -n "$switched" ]; then
+      if [ -n "$checked" ] && [ "$checked" != HEAD ]; then
+        if ! git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$checked"; then
+          info "checked-out branch '$checked': deleted"
+        elif [ -n "$opt_keep" ]; then
+          info "checked-out branch '$checked': kept (--keep-branch)"
+        else
+          warn "checked-out branch '$checked': kept (not merged — see wt's note above)"
+          warn "delete it anyway with: git branch -D $checked"
+        fi
+      fi
+      [ -z "$branch" ] \
+        || grove_reap_room_branch "$REPO_PATH" "$branch" "$def_branch" "$opt_forcedel" "$opt_keep"
+    fi
   fi
 
   # 2. Close the cmux workspace attached to <branch>, if any — LAST, so closing
@@ -1796,11 +2175,12 @@ grove_rm() {
   #    (the second incident: `grove rm` reported "no cmux workspace attached"
   #    to a tab sitting one group over) is found too. Both
   #    missing → no ref (fails safe), leaving nothing to close.
-  local groups workspaces ws groups_ok=1
-  groups=$(CMUX_QUIET=1 "$CMUX" workspace-group list --json 2>/dev/null) \
-    || { groups='{}'; groups_ok=0; }
-  workspaces=$(CMUX_QUIET=1 "$CMUX" workspace list --json 2>/dev/null)   || workspaces='{}'
-  ws=$(grove_workspace_for "$CMUX" "$groups" "$workspaces" "$REPO" "$branch" "$canon_wt")
+  local ws
+  if [ -n "$branch" ]; then
+    ws=$(grove_workspace_for "$CMUX" "$groups" "$workspaces" "$REPO" "$branch" "$canon_wt")
+  else
+    ws=$(grove_env_ref_sweep "$CMUX" "$groups" "$workspaces" "$REPO" "$canon_wt")
+  fi
   if [ -n "$ws" ]; then
     # Half-blind guard: with the GROUP listing failed (a match can still land —
     # the env sweep needs only the workspaces listing), grove can't see any
@@ -1809,9 +2189,22 @@ grove_rm() {
     # keep it inert: leave the tab open and say why, rather than act on
     # anchor state grove couldn't read.
     if [ "$groups_ok" != 1 ]; then
-      warn "found workspace $ws ($branch), but the cmux group listing failed — leaving it open"
+      warn "found workspace $ws ($label), but the cmux group listing failed — leaving it open"
       warn "(grove can't tell whether closing it would dissolve a group; close the tab yourself)"
       return 0
+    fi
+    # Other-room guard (#49): a title hit on a tab stamped for a DIFFERENT
+    # worktree that still exists is another room that happens to share the
+    # name (e.g. `--path` defaulted <branch> to the checked-out branch, and a
+    # room by that name lives elsewhere). Closing it would orphan that room.
+    # The record rung already proved its own tab's stamp, so skip the env read.
+    if [ -n "$canon_wt" ] && { [ "$src" != record ] || [ "$ws" != "$rec_ref" ]; }; then
+      local stamp; stamp=$(grove_ws_stamp "$CMUX" "$ws")
+      if [ -n "$stamp" ] && [ "$stamp" != "$canon_wt" ] \
+         && grove_registered_worktree "$REPO_PATH" "$stamp"; then
+        warn "workspace $ws ($label) belongs to worktree $stamp, which still exists — leaving it open"
+        return 0
+      fi
     fi
     # The env sweep can resolve a tab that was dragged OUT of the repo group
     # (grove_env_ref_sweep) — say so in the close line, and guard the blast
@@ -1826,7 +2219,7 @@ grove_rm() {
       local other_anchor
       other_anchor=$(grove_anchor_of_other_group "$groups" "$REPO" "$ws") || other_anchor=""
       if [ -n "$other_anchor" ]; then
-        warn "workspace $ws ($branch) now anchors group '$other_anchor' — leaving it open"
+        warn "workspace $ws ($label) now anchors group '$other_anchor' — leaving it open"
         warn "(closing it would dissolve that group and orphan its members;"
         warn " re-anchor or move it, then close the tab yourself)"
         return 0
@@ -1857,14 +2250,28 @@ grove_rm() {
     # the flag; a cmux old enough to reject it gets the plain-close retry.
     # When both fail, surface cmux's own error — swallowing it is what hid the
     # 0.65 refusal behind "(already gone?)" in the first place.
-    info "closing workspace ${_c_bld}$ws${_c_rst} ($branch$away)…"
+    # The tab names a different room than <branch> — e.g. `grove rm test/b`
+    # typed for a room 'test/a' whose worktree had test/b checked out (found
+    # by the stamp sweep). That room's own branch was never settled above;
+    # settle it now under the merged/pushed guard (never forced: -D was aimed
+    # at <branch>, not at a name grove inferred). Before the close, which can
+    # end grove when it is grove's own tab.
+    if [ -n "$canon_wt" ] && [ -z "$switched" ]; then
+      local ws_title; ws_title=$(grove_ws_field "$workspaces" "$ws" title)
+      if [ -n "$ws_title" ] && [ "$ws_title" != "$branch" ] \
+         && git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$ws_title"; then
+        info "workspace $ws is room '$ws_title' — settling its branch too"
+        grove_reap_room_branch "$REPO_PATH" "$ws_title" "$def_branch" "" "$opt_keep"
+      fi
+    fi
+    info "closing workspace ${_c_bld}$ws${_c_rst} ($label$away)…"
     local close_out
     close_out=$(CMUX_QUIET=1 "$CMUX" workspace close "$ws" --force 2>&1) \
       || close_out=$(CMUX_QUIET=1 "$CMUX" workspace close "$ws" 2>&1) \
       || { close_out=${close_out//$'\n'/ }
            warn "could not close workspace $ws: ${close_out:-no error text from cmux (already gone?)}"; }
   else
-    info "no cmux workspace attached to '$branch'"
+    info "no cmux workspace attached to '$label'"
   fi
 }
 
@@ -2211,10 +2618,17 @@ ${_c_bld}Usage:${_c_rst}
                                   New branches fetch and branch from origin/<default>
                                   by default; --base <ref> overrides the base (e.g.
                                   @ for current HEAD), --no-fetch stays offline.
-  grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+  grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch]
+           [--path <worktree>] [<branch>]
                                   Tear down a worktree you're done with: close its
                                   cmux workspace and 'wt remove' the worktree
-                                  (defaults to the current branch). Safe by default —
+                                  (defaults to the current worktree). The worktree is
+                                  found by the room's own record (the path its tab was
+                                  spawned with), so a room that checked out another
+                                  branch is still found — then both branches are
+                                  deleted only if merged or pushed. If no worktree is
+                                  found, the tab is left open; --path <worktree> names
+                                  it directly. Safe by default —
                                   refuses a dirty tree without --force, refuses while
                                   a synced path differs from the main checkout
                                   (reported masked; --unmask shows values), and deletes
