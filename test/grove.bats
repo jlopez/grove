@@ -2230,3 +2230,394 @@ _fake_cmux() {   # $1 = `workspace-group list` reply; $2 = `workspace-group crea
   run grep -c 'workspace-group add' "$BATS_TEST_TMPDIR/cmux.log"
   [ "$output" = "0" ]
 }
+
+# --- grove rm resolves the room's worktree by grove's record (#49) ------------
+# A room (the tab `grove go test/a` opened, stamped with its worktree path) can
+# check out another branch inside its worktree. Pre-#49, `grove rm test/a`
+# looked the worktree up by checked-out branch only, missed it, and closed the
+# tab anyway — the worktree and both branches leaked. Fixtures here are REAL
+# git repos (worktrees, merges, a bare origin); cmux and wt are stubs that log
+# their argv, so the whole `grove rm` flow runs without either installed.
+
+_git49() { git -c user.email=t@t -c user.name=t "$@"; }
+
+# _rm49_setup — $R/repo (main, one commit) with a linked worktree $WT_A created
+# on test/a, then switched to test/b inside it (the #49 room). Stubs on $R/bin:
+#   cmux: serves groups.json / workspaces.json / env-<ref>.json, logs every call
+#   wt:   `list --format json` derived from git's real worktree list;
+#         `remove <branch|path>` removes the worktree for real and deletes its
+#         checked-out branch if merged (-D: regardless; --no-delete-branch: kept)
+# Workspaces: workspace:1 = repo header, workspace:2 = room 'test/a' stamped
+# with $WT_A.
+_rm49_setup() {
+  R="$BATS_TEST_TMPDIR/r49"
+  mkdir -p "$R/bin" "$R/wt"
+  git init -q -b main "$R/repo"
+  _git49 -C "$R/repo" commit -q --allow-empty -m init
+  _git49 -C "$R/repo" worktree add -q -b test/a "$R/wt/test-a" main
+  _git49 -C "$R/wt/test-a" checkout -q -b test/b
+  R=$(cd "$R" && pwd -P)
+  REPO49="$R/repo"; WT_A="$R/wt/test-a"
+  cat > "$R/bin/cmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$R/cmux.log"
+case "\$1 \$2" in
+  "workspace-group list") cat "$R/groups.json" ;;
+  "workspace list")       cat "$R/workspaces.json" ;;
+  "workspace env")        cat "$R/env-\${3//:/-}.json" 2>/dev/null ;;
+  "workspace close")      exit 0 ;;
+  *)                      exit 1 ;;
+esac
+SH
+  cat > "$R/bin/wt" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$R/wt.log"
+repo="$REPO49"
+list() {
+  git -C "\$repo" worktree list --porcelain | awk '
+    /^worktree / { p = substr(\$0, 10) }
+    /^branch /   { b = substr(\$0, 19) }
+    /^\$/        { print p "\t" b; p = ""; b = "" }' \
+  | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")
+                 | {path: .[0], branch: (if (.[1] // "") == "" then null else .[1] end)})'
+}
+case "\$1" in
+  list) list ;;
+  remove)
+    shift; t="\$1"; shift; nodel=""; force=""
+    for a in "\$@"; do case "\$a" in --no-delete-branch) nodel=1 ;; -D|--force-delete) force=1 ;; esac; done
+    if [ -d "\$t" ]; then p="\$t"
+    else p=\$(list | jq -r --arg b "\$t" '.[] | select(.branch==\$b) | .path'); fi
+    [ -n "\$p" ] || exit 1
+    b=\$(git -C "\$p" rev-parse --abbrev-ref HEAD)
+    git -C "\$repo" worktree remove --force "\$p" || exit 1
+    if [ -z "\$nodel" ] && [ "\$b" != HEAD ]; then
+      if [ -n "\$force" ]; then git -C "\$repo" branch -q -D "\$b"
+      else git -C "\$repo" branch -q -d "\$b" 2>/dev/null || echo "wt-stub: branch \$b retained"; fi
+    fi ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$R/bin/cmux" "$R/bin/wt"
+  cat > "$R/groups.json" <<'JSON'
+{ "groups": [ { "ref": "workspace_group:1", "name": "repo",
+                "anchor_workspace_ref": "workspace:1",
+                "member_workspace_refs": ["workspace:1", "workspace:2"] } ] }
+JSON
+  cat > "$R/workspaces.json" <<JSON
+{ "workspaces": [
+  { "ref": "workspace:1", "title": "repo",   "current_directory": "$REPO49" },
+  { "ref": "workspace:2", "title": "test/a", "current_directory": "$WT_A" } ] }
+JSON
+  _stamp49 workspace:2 "$WT_A"
+  printf '{ "count": 0, "env": {} }\n' > "$R/env-workspace-1.json"
+}
+
+# _stamp49 <ref> <path> — give workspace <ref> a GROVE_WORKTREE_PATH stamp.
+_stamp49() {
+  printf '{ "count": 1, "env": { "GROVE_WORKTREE_PATH": "%s" } }\n' "$2" > "$R/env-${1//:/-}.json"
+}
+
+# _grm49 [args...] — run the real `grove rm` from the main checkout, stubs first.
+_grm49() {
+  cd "$REPO49"
+  run env PATH="$R/bin:$PATH" GROVE_CMUX="$R/bin/cmux" "$GROVE" rm "$@"
+}
+
+_closed49() { grep '^workspace close' "$R/cmux.log" 2>/dev/null || true; }
+
+@test "linked_worktree: linked yes (canonical), primary no, plain dir no (#49)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  [ "$(grove_linked_worktree "$REPO49" "$WT_A")" = "$WT_A" ]
+  ln -s "$WT_A" "$R/link-a"
+  [ "$(grove_linked_worktree "$REPO49" "$R/link-a")" = "$WT_A" ]   # symlink → canon
+  run grove_linked_worktree "$REPO49" "$REPO49";   [ "$status" -ne 0 ]
+  run grove_linked_worktree "$REPO49" "$R/bin";    [ "$status" -ne 0 ]
+  run grove_linked_worktree "$REPO49" "$WT_A/sub"; [ "$status" -ne 0 ]
+  run grove_linked_worktree "$REPO49" "";          [ "$status" -ne 0 ]
+  grove_registered_worktree "$REPO49" "$REPO49"     # primary counts as registered
+}
+
+@test "room_record: stamped tab → env path; unstamped → cwd; untitled → nothing (#49)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  local g w; g=$(cat "$R/groups.json"); w=$(cat "$R/workspaces.json")
+  [ "$(grove_room_record "$R/bin/cmux" "$g" "$w" repo test/a)" = "workspace:2	env	$WT_A" ]
+  rm "$R/env-workspace-2.json"     # legacy/adopted tab: no stamp → its cwd
+  [ "$(grove_room_record "$R/bin/cmux" "$g" "$w" repo test/a)" = "workspace:2	cwd	$WT_A" ]
+  [ -z "$(grove_room_record "$R/bin/cmux" "$g" "$w" repo test/b)" ]
+  [ -z "$(grove_room_record "$R/bin/cmux" "$g" "$w" other test/a)" ]  # group-scoped
+}
+
+@test "resolve_room_path: the record beats wt list, and finds a switched room wt list can't (#49 point 1)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  # The #49 room: wt list knows no worktree for test/a (it has test/b checked
+  # out) — the stamp still names it.
+  [ "$(grove_resolve_room_path "$REPO49" env "$WT_A" "")" = "record	$WT_A" ]
+  # The record wins even when wt list points elsewhere.
+  _git49 -C "$REPO49" worktree add -q -b test/c "$R/wt/test-c" main
+  [ "$(grove_resolve_room_path "$REPO49" env "$WT_A" "$R/wt/test-c")" = "record	$WT_A" ]
+  # No record → wt list, as before #49.
+  [ "$(grove_resolve_room_path "$REPO49" "" "" "$R/wt/test-c")" = "wtlist	$R/wt/test-c" ]
+}
+
+@test "resolve_room_path: cwd only without a stamp (subdir → root); a stale stamp doesn't fall to cwd (#49)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  mkdir -p "$WT_A/src/deep"
+  [ "$(grove_resolve_room_path "$REPO49" cwd "$WT_A/src/deep" "")" = "cwd	$WT_A" ]
+  [ "$(grove_resolve_room_path "$REPO49" cwd "$R/bin" "")" = "none	" ]      # cwd outside any worktree
+  [ "$(grove_resolve_room_path "$REPO49" cwd "$REPO49" "")" = "none	" ]      # primary is never a target
+  [ "$(grove_resolve_room_path "$REPO49" env "$R/bin" "")" = "none	" ]      # stamp not a worktree
+}
+
+@test "resolve_room_path: a recorded path that's gone everywhere → gone; nothing at all → none (#49 point 2)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  [ "$(grove_resolve_room_path "$REPO49" env "$R/wt/vanished" "")" = "gone	$R/wt/vanished" ]
+  [ "$(grove_resolve_room_path "$REPO49" cwd "$R/wt/vanished" "")" = "gone	$R/wt/vanished" ]
+  [ "$(grove_resolve_room_path "$REPO49" none "" "")" = "none	" ]
+  [ "$(grove_resolve_room_path "$REPO49" "" "" "")" = "none	" ]
+  # Registered but its directory deleted (prunable): not "gone" — git still
+  # tracks it, so the tab must not be closed on a guess.
+  _git49 -C "$REPO49" worktree add -q -b test/p "$R/wt/test-p" main
+  rm -rf "$R/wt/test-p"
+  [ "$(grove_resolve_room_path "$REPO49" env "$R/wt/test-p" "")" = "none	" ]
+}
+
+@test "branch_disposable: merged, squash-merged, patch-id, pushed → yes; unmerged → no (#49 point 3)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  local r="$REPO49"
+  _git49 -C "$r" branch same main
+  [ "$(grove_branch_disposable "$r" same main)" = "same commit as main" ]
+  # ancestor: main moved on past it
+  _git49 -C "$r" branch anc main
+  _git49 -C "$r" commit -q --allow-empty -m later
+  [ "$(grove_branch_disposable "$r" anc main)" = "ancestor of main" ]
+  # squash-merged, then main moved on in other files → merge adds nothing
+  _git49 -C "$r" checkout -q -b sq main
+  echo s > "$r/s.txt"; _git49 -C "$r" add s.txt; _git49 -C "$r" commit -qm s
+  _git49 -C "$r" checkout -q main
+  _git49 -C "$r" merge -q --squash sq; _git49 -C "$r" commit -qm "squash sq"
+  echo o > "$r/o.txt"; _git49 -C "$r" add o.txt; _git49 -C "$r" commit -qm other
+  run grove_branch_disposable "$r" sq main
+  [ "$status" -eq 0 ]
+  # squash-merged, then main rewrote the same file → only patch-id matches
+  _git49 -C "$r" checkout -q -b pid main
+  echo p > "$r/p.txt"; _git49 -C "$r" add p.txt; _git49 -C "$r" commit -qm p
+  _git49 -C "$r" checkout -q main
+  _git49 -C "$r" merge -q --squash pid; _git49 -C "$r" commit -qm "squash pid"
+  echo q > "$r/p.txt"; _git49 -C "$r" commit -qam "rewrite p"
+  [ "$(grove_branch_disposable "$r" pid main)" = "squash-merged into main" ]
+  # unmerged
+  _git49 -C "$r" checkout -q -b un main
+  echo u > "$r/u.txt"; _git49 -C "$r" add u.txt; _git49 -C "$r" commit -qm u
+  _git49 -C "$r" checkout -q main
+  run grove_branch_disposable "$r" un main
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+  # the same unmerged branch, pushed to origin → its content is safe there
+  git init -q --bare "$R/origin.git"
+  git -C "$r" remote add origin "$R/origin.git"
+  git -C "$r" push -q origin un 2>/dev/null
+  [ "$(grove_branch_disposable "$r" un main)" = "pushed to origin/un" ]
+  # ...but a local commit beyond the pushed tip is not
+  _git49 -C "$r" checkout -q un; _git49 -C "$r" commit -q --allow-empty -m more
+  _git49 -C "$r" checkout -q main
+  run grove_branch_disposable "$r" un main
+  [ "$status" -ne 0 ]
+  run grove_branch_disposable "$r" nosuch main
+  [ "$status" -ne 0 ]
+}
+
+@test "reap_room_branch: --keep-branch, default, checked out elsewhere, unmerged are kept; -D deletes (#49 point 3)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  local r="$REPO49"
+  # (an EMPTY commit would count as merged — it adds no changes, wt agrees)
+  _git49 -C "$r" checkout -q -b un main
+  echo u > "$r/u.txt"; _git49 -C "$r" add u.txt; _git49 -C "$r" commit -qm u
+  _git49 -C "$r" checkout -q main
+  run grove_reap_room_branch "$r" un main "" 1;  [[ "$output" == *"kept (--keep-branch)"* ]]
+  run grove_reap_room_branch "$r" main main "" ""; [[ "$output" == *"default branch"* ]]
+  run grove_reap_room_branch "$r" test/b main "" ""; [[ "$output" == *"checked out in"* ]]
+  git -C "$r" show-ref --verify --quiet refs/heads/test/b
+  run grove_reap_room_branch "$r" un main "" ""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"kept"* ]]
+  [[ "$output" == *"git branch -D un"* ]]
+  git -C "$r" show-ref --verify --quiet refs/heads/un
+  run grove_reap_room_branch "$r" un main 1 ""
+  [[ "$output" == *"deleted (-D)"* ]]
+  run git -C "$r" show-ref --verify --quiet refs/heads/un; [ "$status" -ne 0 ]
+  run grove_reap_room_branch "$r" gone main "" ""; [[ "$output" == *"no local branch"* ]]
+}
+
+@test "rm: a room that switched branches is removed by path, both branches settled, tab closed (#49 points 1+3)" {
+  _rm49_setup
+  _grm49 test/a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resolved from workspace workspace:2's record"* ]]
+  [ "$(cat "$R/wt.log" | grep '^remove')" = "remove $WT_A -y" ]   # by PATH
+  [ ! -d "$WT_A" ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/b; [ "$status" -ne 0 ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm: switched room with an unmerged room branch keeps it and says how to delete it (#49 point 3)" {
+  _rm49_setup
+  # test/a gets its own work before the room switches away from it
+  _git49 -C "$WT_A" checkout -q test/a
+  echo a > "$WT_A/a.txt"; _git49 -C "$WT_A" add a.txt; _git49 -C "$WT_A" commit -qm "work on a"
+  _git49 -C "$WT_A" checkout -q test/b
+  _grm49 test/a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"room branch 'test/a': kept"* ]]
+  [[ "$output" == *"git branch -D test/a"* ]]
+  [[ "$output" == *"checked-out branch 'test/b': deleted"* ]]
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a
+  [ ! -d "$WT_A" ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm: switched room + -D deletes both branches; --keep-branch keeps both (#49 point 3)" {
+  _rm49_setup
+  _git49 -C "$WT_A" checkout -q test/a
+  _git49 -C "$WT_A" commit -q --allow-empty -m "work on a"
+  _git49 -C "$WT_A" checkout -q test/b
+  _git49 -C "$WT_A" commit -q --allow-empty -m "work on b"
+  _grm49 -D test/a
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove $WT_A -y --force-delete" ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/b; [ "$status" -ne 0 ]
+
+  rm -rf "$BATS_TEST_TMPDIR/r49"
+  _rm49_setup
+  _grm49 --keep-branch test/a
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove $WT_A -y --no-delete-branch" ]
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/test/b
+}
+
+@test "rm: same-branch room is unchanged — wt remove by branch name (#49)" {
+  _rm49_setup
+  _git49 -C "$WT_A" checkout -q test/a
+  _grm49 test/a
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove test/a -y" ]
+  [[ "$output" != *"resolved from"* ]]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm: no worktree found → the tab is NOT closed, its record and --path are printed, exit 1 (#49 point 2)" {
+  _rm49_setup
+  _stamp49 workspace:2 "$R/bin"        # recorded path exists but is no worktree
+  _grm49 test/a
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no worktree for 'test/a' — leaving workspace workspace:2 open"* ]]
+  [[ "$output" == *"$R/bin"* ]]
+  [[ "$output" == *"grove rm --path"* ]]
+  [ -z "$(_closed49)" ]
+  ! grep -q '^remove' "$R/wt.log"
+  [ -d "$WT_A" ]
+}
+
+@test "rm: recorded worktree already gone → the orphan tab is closed, nothing removed (#49 point 2)" {
+  _rm49_setup
+  _stamp49 workspace:2 "$R/wt/vanished"
+  _git49 -C "$WT_A" checkout -q test/a
+  _git49 -C "$REPO49" worktree remove --force "$WT_A"     # e.g. `wt merge` got there first
+  _grm49 test/a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already gone"* ]]
+  ! grep -q '^remove' "$R/wt.log"
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm: no worktree and no tab → nothing closed, exit 0 (#49 point 2)" {
+  _rm49_setup
+  _grm49 test/nope
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no worktree for 'test/nope'"* ]]
+  [ -z "$(_closed49)" ]
+}
+
+@test "rm --path: needs a value, rejects a non-worktree dir and the primary checkout (#49 point 4)" {
+  _rm49_setup
+  _grm49 --path
+  [ "$status" -ne 0 ]; [[ "$output" == *"--path needs a worktree directory"* ]]
+  _grm49 --path=
+  [ "$status" -ne 0 ]; [[ "$output" == *"--path needs a worktree directory"* ]]
+  _grm49 --path "$R/bin"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a linked worktree"* ]]
+  _grm49 --path "$REPO49"
+  [ "$status" -ne 0 ]; [[ "$output" == *"primary checkout"* ]]
+  [ ! -e "$R/wt.log" ] || ! grep -q '^remove' "$R/wt.log"
+  [ -z "$(_closed49)" ]
+}
+
+@test "rm --path: the escape hatch — room name from the stamped tab, removed by path (#49 point 4)" {
+  _rm49_setup
+  # Make the record useless: the tab lost its title, so neither title nor wt
+  # list can find 'test/a' — only the path can.
+  sed -i.bak 's/"title": "test\/a"/"title": "renamed"/' "$R/workspaces.json"
+  _grm49 --path "$WT_A"
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove $WT_A -y" ]
+  [ ! -d "$WT_A" ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]   # found by its stamp
+}
+
+@test "rm --path=<dir> <branch>: explicit room name settles that branch too (#49 point 4)" {
+  _rm49_setup
+  rm "$R/env-workspace-2.json"          # unstamped tab
+  _grm49 "--path=$WT_A" test/a
+  [ "$status" -eq 0 ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm with no args inside a switched room resolves it by the worktree, not the branch (#49)" {
+  _rm49_setup
+  cd "$WT_A"
+  run env PATH="$R/bin:$PATH" GROVE_CMUX="$R/bin/cmux" "$GROVE" rm
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove $WT_A -y" ]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm: a same-titled tab stamped for ANOTHER live worktree is left open (#49)" {
+  _rm49_setup
+  # A second room titled 'test/b' lives at its own worktree. --path on the
+  # first room with an unstamped tab defaults the name to its checked-out
+  # branch, test/b — the title rung must not close the other room's tab.
+  _git49 -C "$REPO49" worktree add -q -b test/c "$R/wt/test-c" main
+  rm "$R/env-workspace-2.json"
+  cat > "$R/workspaces.json" <<JSON
+{ "workspaces": [
+  { "ref": "workspace:1", "title": "repo",   "current_directory": "$REPO49" },
+  { "ref": "workspace:2", "title": "test/a", "current_directory": "$WT_A" },
+  { "ref": "workspace:3", "title": "test/b", "current_directory": "$R/wt/test-c" } ] }
+JSON
+  sed -i.bak 's/"workspace:2"\]/"workspace:2", "workspace:3"]/' "$R/groups.json"
+  _stamp49 workspace:3 "$R/wt/test-c"
+  _grm49 --path "$WT_A"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"belongs to worktree $R/wt/test-c"* ]]
+  [ -z "$(_closed49)" ]
+  [ -d "$R/wt/test-c" ]
+}
