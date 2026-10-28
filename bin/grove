@@ -2592,10 +2592,17 @@ ${_c_bld}Usage:${_c_rst}
                                   New branches fetch and branch from origin/<default>
                                   by default; --base <ref> overrides the base (e.g.
                                   @ for current HEAD), --no-fetch stays offline.
-  grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+  grove rm [--force] [--unmask] [-D] [--keep-branch] [--reap] [--no-fetch]
+           [--path <worktree>] [<branch>]
                                   Tear down a worktree you're done with: close its
                                   cmux workspace and 'wt remove' the worktree
-                                  (defaults to the current branch). Safe by default —
+                                  (defaults to the current worktree). The worktree is
+                                  found by the room's own record (the path its tab was
+                                  spawned with), so a room that checked out another
+                                  branch is still found — then both branches are
+                                  deleted only if merged or pushed. If no worktree is
+                                  found, the tab is left open; --path <worktree> names
+                                  it directly. Safe by default —
                                   refuses a dirty tree without --force, refuses while
                                   a synced path differs from the main checkout
                                   (reported masked; --unmask shows values), and deletes

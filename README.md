@@ -44,9 +44,9 @@ This drops `grove` into `~/.local/bin`. Then `grove init` wires the optional bit
 
 ```
 grove go <branch> [prompt...]        Create a worktree + spawn a cmux Claude agent
-grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [<branch>]
+grove rm [--force] [-D] [--keep-branch] [--reap] [--no-fetch] [--path <worktree>] [<branch>]
                                      Done with a feature: remove the worktree +
-                                     close its cmux tab (defaults to current branch)
+                                     close its cmux tab (defaults to the current worktree)
 grove sync [list|check|add|rm]       Manage the untracked paths carried into worktrees
 grove init [--with-multi-account]    Optional wiring (wt alias, cmux plugin, direnv)
 grove doctor                         Check dependencies and wiring
@@ -166,6 +166,16 @@ If you use [direnv](https://direnv.net) to switch `gh` accounts per directory (e
 4. files the workspace under the repo's group via `cmux workspace-group add`, creating the group (anchor = main checkout) on first use.
 
 cmux is reachable because grove runs from a cmux tab and inherits `CMUX_*` env, so the new workspace lands in the right window.
+
+`grove rm <branch>` is the inverse. It finds the worktree by the room's own record first
+— the path its tab was spawned with (`GROVE_WORKTREE_PATH`) — and only then by
+`wt list`, so a room that checked out another branch inside its worktree is still found.
+Such a room is removed by path, and **both** branches are deleted only when merged into
+the default branch or pushed to `origin/<branch>` (`-D` deletes regardless,
+`--keep-branch` keeps both); a branch it keeps comes with the exact `git branch -D` to
+run. The worktree goes first and the tab last — and if no worktree is found, the tab is
+left open (exit 1) rather than closed over a worktree grove couldn't see. Point grove at
+the worktree directly with `grove rm --path <worktree>`.
 
 ### Env
 

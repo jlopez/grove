@@ -75,6 +75,13 @@ setup() {
   [[ "$output" == *"usage: grove rm"* ]]
 }
 
+@test "rm -h and help document --path (#49 point 4)" {
+  run "$GROVE" rm -h
+  [[ "$output" == *"--path <worktree>"* ]]
+  run "$GROVE" help
+  [[ "$output" == *"[--path <worktree>]"* ]]
+}
+
 @test "rm rejects an unknown option" {
   run "$GROVE" rm --frobnicate
   [ "$status" -ne 0 ]

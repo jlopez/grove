@@ -98,15 +98,21 @@ cmux tab can drive cmux back into the same window. Run `grove go` from a cmux ta
 
 ## The `grove rm` flow
 
-`grove rm [<branch>]` is the **inverse of `grove go`** — the teardown for when you're done
+`grove rm [--path <worktree>] [<branch>]` is the **inverse of `grove go`** — the teardown for when you're done
 with a feature. It exists because grove owns a bridge nobody else does: the
 **workspace↔branch mapping**. `wt remove` and `wt merge` both know how to drop the *worktree*,
 but they leave the *cmux tab* dangling — only grove knows which tab is attached to which
 branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
 
-1. **Resolve the target branch** — the argument, or the current worktree's branch if omitted
-   (mirroring `wt remove`'s "current" default), so `grove rm` from inside the worktree you're
-   finished with just works.
+1. **Resolve the room's worktree** — by grove's own record first, `wt list` second (issue
+   #49; see [Resolving the room's worktree](#resolving-the-rooms-worktree--issue-49) below).
+   `<branch>` is the room's *name* — the title `grove go` gave its tab. Omitted, grove takes
+   the worktree you're standing in (mirroring `wt remove`'s "current" default) **by path**,
+   and names the room after the tab stamped with that path (else the checked-out branch), so
+   `grove rm` from inside the worktree you're finished with just works — even after the room
+   switched branches. `--path <worktree>` names the worktree outright (it must be a
+   registered linked worktree of this repo); `<branch>` then defaults the same way. If no
+   worktree is found, **the tab is not closed**.
 2. **Primary-checkout guard** — refuse if the branch resolves to the repo's main checkout (the
    group's anchor/header); canonicalized-path compare, as `grove go` does. Removing a *member*
    leaves the group intact — only closing the **anchor** dissolves it — so teardown never
@@ -140,6 +146,22 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    `--keep-branch` → `wt --no-delete-branch`, and `--reap` → `wt --reap` (kill stray dev
    servers/watchers under the worktree before removal). No worktree for the branch → nothing to
    remove.
+
+   **A room that switched branches** (its worktree has a branch other than the room's checked
+   out — #49 point 3) is removed **by path**: `wt remove <path> -y`, so wt applies the same
+   dirty-tree refusal and merged-only deletion to the *checked-out* branch. wt never sees the
+   *room* branch (it is no longer checked out anywhere), so grove settles it itself
+   (`grove_reap_room_branch`) under a guard mirroring wt's: deleted iff its tip is contained
+   in `origin/<branch>` (pushed — every commit already lives on the remote), or it passes
+   wt's six "adds nothing to the default branch" checks — same commit, ancestor, empty
+   three-dot diff, tree match, simulated merge (`git merge-tree --write-tree`), patch-id
+   against one commit on the target (capped at 500) — run against the local default branch
+   and `origin/<default>` (`grove_branch_disposable`). `-D` deletes it regardless,
+   `--keep-branch` keeps both branches; a kept branch is reported with the exact
+   `git branch -D <branch>`. It is never deleted when it is the default branch or checked out
+   in another worktree, and grove passes `--no-delete-branch` to wt should a room have checked
+   out the default branch itself. The outcome is printed for **both** branches. A room whose
+   worktree still has its own branch checked out takes the unchanged `wt remove <branch>` path.
 6. **Close the cmux workspace** attached to the branch — the **shared matcher**
    (`grove_workspace_for`, issue #18; the same one behind the `grove go` gate) finds the ref,
    then `cmux workspace close <ref>`. Title match first; on a miss, the env fallback keyed on
@@ -159,7 +181,10 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    of exactly that state.
    Done **last**, so closing `grove`'s own tab can't abort
    the removal above. Both title and stamp missing (legacy/unstamped tab) → no ref, skipped
-   (fails safe).
+   (fails safe). One more refusal (#49): a title-matched tab whose stamp names a *different*
+   worktree that still exists is another room sharing the name — e.g. `--path` on an
+   unstamped room defaulted `<branch>` to its checked-out branch, and a room of that name
+   lives elsewhere — so grove leaves it open rather than orphan that room.
 
    **Anchor guard (issue #22).** In a *legacy or UI-created* group the anchor can be any member
    tab — not the repo header — and closing it would dissolve the group and orphan every other
@@ -175,6 +200,40 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    closed. If any of that fails, `grove rm` refuses to close the tab (warn, not die — the
    worktree is already removed) rather than dissolve the group; the warning names the manual
    fix (`cmux workspace-group set-anchor`).
+
+### Resolving the room's worktree — issue #49
+
+Pre-#49, `grove rm <branch>` looked the worktree up with `wt list`, which keys each worktree
+on the branch it has checked out **now**. Rooms switch branches routinely — stacked PRs,
+testing a sibling's branch — and a switched room was then invisible: grove printed `no
+worktree for '<branch>'`, closed the tab anyway (step 6 ran regardless), and left the
+worktree and both local branches behind, with nothing in the sidebar pointing at them any
+more. The fix rests on the fact that grove *already* keeps a durable record of every room:
+the `GROVE_WORKTREE_PATH` stamp (below), written at create time and unaffected by whatever
+the agent later checks out. Resolution order (`grove_room_record` +
+`grove_resolve_room_path`):
+
+1. `--path <dir>` given → that worktree (canonicalized; it must be a registered linked
+   worktree of this repo with its directory present, else grove dies).
+2. **Record** — the tab titled `<branch>` in the repo group (the title is the room's name;
+   the branch switch doesn't touch it). Its stamp, if it is a registered linked worktree,
+   wins — even over a different answer from `wt list` (grove says so when they differ). Only
+   an **unstamped** tab (legacy/adopted) falls back to its `current_directory`, mapped to the
+   root of the worktree containing it; a stale stamp never falls through to the cwd.
+3. **`wt list`** — the pre-#49 lookup by checked-out branch, for rooms with no usable record
+   (a branch renamed after `grove go` still lands here, and its tab is then found by the
+   matcher's env sweep, as before).
+4. **Nothing found → the tab stays open** (#49 point 2), and grove exits 1, printing the tab's
+   ref, its recorded path, and the `grove rm --path <worktree> <branch>` escape hatch (or
+   `git worktree prune` when git still registers a directory that is gone). The one
+   exception: when the recorded path **neither exists nor is registered** — the worktree is
+   already removed (`wt merge`, a manual `git worktree remove`) — the tab is an orphan and
+   closing it is correct; grove says "already gone" and closes it, which keeps the
+   `wt merge` → `grove rm` composition below working. No tab and no worktree → nothing to
+   do (exit 0).
+
+Paths are compared canonicalized throughout (`pwd -P`): the stamp, cmux's cwd and git's
+worktree list can spell a symlinked location differently (`/tmp` vs `/private/tmp`).
 
 **Safety model (ratifying issue #15).** #15 proposed a GitHub-PR-state merge guard
 (`gh pr view --json state`) because a naive `git branch --merged` reports squash-merged
