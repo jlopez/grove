@@ -2007,8 +2007,9 @@ grove_rm() {
     case "$src" in
       record|cwd)
         canon_wt=${res#*$'\t'}
-        [ -n "$wl" ] && [ "$(grove_canon "$wl")" = "$canon_wt" ] \
-          || info "worktree for '$branch' resolved from workspace $rec_ref's record: $canon_wt (wt list: ${wl:-no worktree on that branch})" ;;
+        if [ -z "$wl" ] || [ "$(grove_canon "$wl")" != "$canon_wt" ]; then
+          info "worktree for '$branch' resolved from workspace $rec_ref's record: $canon_wt (wt list: ${wl:-no worktree on that branch})"
+        fi ;;
       wtlist)
         canon_wt=${res#*$'\t'} ;;
       gone)
