@@ -160,8 +160,13 @@ branch (the same shared matcher that powers the `grove go` gate). So `grove rm`:
    `--keep-branch` keeps both branches; a kept branch is reported with the exact
    `git branch -D <branch>`. It is never deleted when it is the default branch or checked out
    in another worktree, and grove passes `--no-delete-branch` to wt should a room have checked
-   out the default branch itself. The outcome is printed for **both** branches. A room whose
-   worktree still has its own branch checked out takes the unchanged `wt remove <branch>` path.
+   out the default branch itself (dropping `-D` from wt's flags, since wt rejects the pair —
+   protecting the default branch wins; `-D` still applies to the room branch). The outcome is
+   printed for **both** branches. A room whose worktree still has its own branch checked out
+   takes the unchanged `wt remove <branch>` path. Typing the *checked-out* branch instead of
+   the room name (`grove rm test/b` for room `test/a`) also lands there — the tab is then
+   found by its stamp in step 6, and before closing it grove settles the branch the tab is
+   titled after under the same guard (never forced: `-D` was aimed at the name you typed).
 6. **Close the cmux workspace** attached to the branch — the **shared matcher**
    (`grove_workspace_for`, issue #18; the same one behind the `grove go` gate) finds the ref,
    then `cmux workspace close <ref>`. Title match first; on a miss, the env fallback keyed on
@@ -229,7 +234,11 @@ the agent later checks out. Resolution order (`grove_room_record` +
    exception: when the recorded path **neither exists nor is registered** — the worktree is
    already removed (`wt merge`, a manual `git worktree remove`) — the tab is an orphan and
    closing it is correct; grove says "already gone" and closes it, which keeps the
-   `wt merge` → `grove rm` composition below working. No tab and no worktree → nothing to
+   `wt merge` → `grove rm` composition below working. A worktree that was **moved**
+   (`git worktree move`) *and* switched branches also reads as gone — its stamp names a path
+   that no longer exists, and `wt list` can't find the room branch — so the tab is closed and
+   the moved worktree stays; grove warns first when the room branch still exists unmerged,
+   pointing at `grove rm --path <worktree> <branch>`. No tab and no worktree → nothing to
    do (exit 0).
 
 Paths are compared canonicalized throughout (`pwd -P`): the stamp, cmux's cwd and git's

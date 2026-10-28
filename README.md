@@ -170,10 +170,10 @@ cmux is reachable because grove runs from a cmux tab and inherits `CMUX_*` env, 
 `grove rm <branch>` is the inverse. It finds the worktree by the room's own record first
 — the path its tab was spawned with (`GROVE_WORKTREE_PATH`) — and only then by
 `wt list`, so a room that checked out another branch inside its worktree is still found.
-Such a room is removed by path, and **both** branches are deleted only when merged into
-the default branch or pushed to `origin/<branch>` (`-D` deletes regardless,
-`--keep-branch` keeps both); a branch it keeps comes with the exact `git branch -D` to
-run. The worktree goes first and the tab last — and if no worktree is found, the tab is
+Such a room is removed by path, and both branches are settled: the checked-out branch is
+deleted when merged into the default branch (wt's rule), the room branch when merged or
+pushed to `origin/<branch>` (`-D` deletes both regardless, `--keep-branch` keeps both); a
+branch it keeps comes with the exact `git branch -D` to run. The worktree goes first and the tab last — and if no worktree is found, the tab is
 left open (exit 1) rather than closed over a worktree grove couldn't see. Point grove at
 the worktree directly with `grove rm --path <worktree>`.
 

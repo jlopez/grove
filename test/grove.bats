@@ -2538,7 +2538,7 @@ _closed49() { grep '^workspace close' "$R/cmux.log" 2>/dev/null || true; }
   [[ "$output" == *"$R/bin"* ]]
   [[ "$output" == *"grove rm --path"* ]]
   [ -z "$(_closed49)" ]
-  ! grep -q '^remove' "$R/wt.log"
+  run grep -q '^remove' "$R/wt.log"; [ "$status" -ne 0 ]
   [ -d "$WT_A" ]
 }
 
@@ -2550,7 +2550,8 @@ _closed49() { grep '^workspace close' "$R/cmux.log" 2>/dev/null || true; }
   _grm49 test/a
   [ "$status" -eq 0 ]
   [[ "$output" == *"already gone"* ]]
-  ! grep -q '^remove' "$R/wt.log"
+  [[ "$output" != *"left behind"* ]]      # test/a is merged — nothing to flag
+  run grep -q '^remove' "$R/wt.log"; [ "$status" -ne 0 ]
   [ "$(_closed49)" = "workspace close workspace:2 --force" ]
 }
 
@@ -2572,7 +2573,7 @@ _closed49() { grep '^workspace close' "$R/cmux.log" 2>/dev/null || true; }
   [ "$status" -ne 0 ]; [[ "$output" == *"not a linked worktree"* ]]
   _grm49 --path "$REPO49"
   [ "$status" -ne 0 ]; [[ "$output" == *"primary checkout"* ]]
-  [ ! -e "$R/wt.log" ] || ! grep -q '^remove' "$R/wt.log"
+  run grep -q '^remove' "$R/wt.log"; [ "$status" -ne 0 ]
   [ -z "$(_closed49)" ]
 }
 
@@ -2627,4 +2628,67 @@ JSON
   [[ "$output" == *"belongs to worktree $R/wt/test-c"* ]]
   [ -z "$(_closed49)" ]
   [ -d "$R/wt/test-c" ]
+}
+
+@test "rm: moved+switched worktree reads as gone — an unmerged room branch is flagged before the close (#49)" {
+  _rm49_setup
+  _git49 -C "$WT_A" checkout -q test/a
+  echo a > "$WT_A/a.txt"; _git49 -C "$WT_A" add a.txt; _git49 -C "$WT_A" commit -qm "work on a"
+  _git49 -C "$WT_A" checkout -q test/b
+  _git49 -C "$REPO49" worktree move "$WT_A" "$R/wt/moved"
+  _grm49 test/a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already gone"* ]]
+  [[ "$output" == *"room branch 'test/a' still exists and is not merged"* ]]
+  [[ "$output" == *"grove rm --path <worktree> test/a"* ]]
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a
+  [ -d "$R/wt/moved" ]
+}
+
+@test "rm -D on a switched room whose worktree has the default branch: no --force-delete beside --no-delete-branch (#49)" {
+  _rm49_setup
+  _git49 -C "$REPO49" checkout -q -b other
+  _git49 -C "$WT_A" checkout -q main
+  _grm49 -D test/a
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove $WT_A -y --no-delete-branch" ]
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/main
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+}
+
+@test "branch_disposable: works from a deleted cwd (patch-id runs in the repo) (#49)" {
+  set +eu
+  source "$GROVE"
+  _rm49_setup
+  local r="$REPO49"
+  _git49 -C "$r" checkout -q -b pid main
+  echo p > "$r/p.txt"; _git49 -C "$r" add p.txt; _git49 -C "$r" commit -qm p
+  _git49 -C "$r" checkout -q main
+  _git49 -C "$r" merge -q --squash pid; _git49 -C "$r" commit -qm "squash pid"
+  echo q > "$r/p.txt"; _git49 -C "$r" commit -qam "rewrite p"
+  mkdir "$R/doomed"; cd "$R/doomed"; rmdir "$R/doomed"
+  [ "$(grove_branch_disposable "$r" pid main)" = "squash-merged into main" ]
+}
+
+@test "rm <checked-out branch> on a switched room also settles the room's own branch (#49)" {
+  _rm49_setup
+  _grm49 test/b                      # typed the checked-out branch, not the room name
+  [ "$status" -eq 0 ]
+  [ "$(grep '^remove' "$R/wt.log")" = "remove test/b -y" ]
+  [[ "$output" == *"workspace workspace:2 is room 'test/a'"* ]]
+  [[ "$output" == *"room branch 'test/a': deleted"* ]]
+  run git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a; [ "$status" -ne 0 ]
+  [ "$(_closed49)" = "workspace close workspace:2 --force" ]
+}
+
+@test "rm <checked-out branch>: an unmerged room branch is kept with the delete hint, never forced (#49)" {
+  _rm49_setup
+  _git49 -C "$WT_A" checkout -q test/a
+  echo a > "$WT_A/a.txt"; _git49 -C "$WT_A" add a.txt; _git49 -C "$WT_A" commit -qm "work on a"
+  _git49 -C "$WT_A" checkout -q test/b
+  _grm49 -D test/b
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"room branch 'test/a': kept"* ]]
+  [[ "$output" == *"git branch -D test/a"* ]]
+  git -C "$REPO49" show-ref --verify --quiet refs/heads/test/a
 }

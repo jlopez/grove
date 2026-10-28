@@ -23,7 +23,10 @@ All notable changes to grove are documented here. Format follows
   otherwise, never when it is the default branch or checked out elsewhere; `-D` and
   `--keep-branch` apply to both. New **`grove rm --path <worktree>`** names the worktree
   directly, and a bare `grove rm` now resolves the current worktree by path. A
-  title-matched tab stamped for another live worktree is never closed.
+  title-matched tab stamped for another live worktree is never closed. `grove rm` typed
+  with the checked-out branch instead of the room name also settles the room's branch
+  (merged/pushed only), and closing an orphan tab whose room branch is still unmerged
+  warns first (a moved worktree reads as gone; use `--path`).
 - **A brand-new repo group lists its first workspace again (cmux ≥ 0.65).** `grove go`
   into a repo with no cmux group yet created the group with `workspace-group create
   --from <spawn>`, which on cmux 0.65 *promotes* the spawned workspace to the group's

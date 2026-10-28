@@ -1835,10 +1835,10 @@ grove_branch_disposable() {
     [ -n "$mt" ] && [ "${mt%%$'\n'*}" = "$tt" ] \
       && { printf 'merging into %s adds nothing\n' "$name"; return 0; }
     mb=$(git -C "$repo" merge-base "$t" "$tip" 2>/dev/null) || continue
-    pid=$(git -C "$repo" diff "$mb" "$tip" | git patch-id --stable | cut -d' ' -f1)
+    pid=$(git -C "$repo" diff "$mb" "$tip" | git -C "$repo" patch-id --stable | cut -d' ' -f1)
     [ -n "$pid" ] || continue
     pids=$(git -C "$repo" log -p --no-merges -n 500 "$mb..$t" 2>/dev/null \
-             | git patch-id --stable | cut -d' ' -f1)
+             | git -C "$repo" patch-id --stable | cut -d' ' -f1)
     grep -Fxq -- "$pid" <<<"$pids" \
       && { printf 'squash-merged into %s\n' "$name"; return 0; }
   done
@@ -2015,7 +2015,16 @@ grove_rm() {
         # The record names a worktree that no longer exists anywhere (removed
         # by `wt merge` or by hand): the tab is an orphan — closing it is the
         # one close that needs no worktree.
-        info "worktree for '$branch' already gone ($rec_path) — closing its orphaned workspace" ;;
+        info "worktree for '$branch' already gone ($rec_path) — closing its orphaned workspace"
+        # A worktree that was MOVED (git worktree move) and then switched
+        # branches also lands here — its stamp no longer exists — so an
+        # unmerged room branch left behind is worth a pointer before the tab
+        # (the only thing still naming the room) goes.
+        if git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$branch" \
+           && ! grove_branch_disposable "$REPO_PATH" "$branch" "$(grove_default_branch)" >/dev/null; then
+          warn "room branch '$branch' still exists and is not merged — it was left behind"
+          warn "if its worktree was moved, remove it with: grove rm --path <worktree> $branch"
+        fi ;;
       *)
         # Nothing found. Never close the tab here: it may still point at a
         # worktree grove failed to see, and closing it would strand that
@@ -2054,11 +2063,9 @@ grove_rm() {
   local checked="" switched="" def_branch=""
   if [ -n "$canon_wt" ]; then
     checked=$(git -C "$canon_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || checked=""
-    if [ -z "$branch" ] || [ "$checked" != "$branch" ]; then
-      switched=1
-      # Read now: after `wt remove`, grove's own cwd may be the deleted worktree.
-      def_branch=$(grove_default_branch)
-    fi
+    # Read now: after `wt remove`, grove's own cwd may be the deleted worktree.
+    def_branch=$(grove_default_branch)
+    [ -n "$branch" ] && [ "$checked" = "$branch" ] || switched=1
   fi
 
   # 0. Synced-path guard (sync.paths). The worktree is about to be deleted and
@@ -2119,10 +2126,14 @@ grove_rm() {
     local rm_args=("$branch" -y)
     [ -z "$switched" ]     || rm_args=("$canon_wt" -y)
     [ -n "$opt_force" ]    && rm_args+=(--force)
-    [ -n "$opt_forcedel" ] && rm_args+=(--force-delete)
     # Never let wt delete the default branch, should a room have checked it out.
+    # That protection outranks -D: wt rejects --force-delete together with
+    # --no-delete-branch, so -D is dropped from wt's flags (it still applies
+    # to the room branch, which grove settles itself below).
     if [ -n "$opt_keep" ] || { [ -n "$switched" ] && [ -n "$def_branch" ] && [ "$checked" = "$def_branch" ]; }; then
       rm_args+=(--no-delete-branch)
+    else
+      [ -n "$opt_forcedel" ] && rm_args+=(--force-delete)
     fi
     [ -n "$opt_reap" ]     && rm_args+=(--reap)
     if [ -n "$switched" ]; then
@@ -2238,6 +2249,20 @@ grove_rm() {
     # the flag; a cmux old enough to reject it gets the plain-close retry.
     # When both fail, surface cmux's own error — swallowing it is what hid the
     # 0.65 refusal behind "(already gone?)" in the first place.
+    # The tab names a different room than <branch> — e.g. `grove rm test/b`
+    # typed for a room 'test/a' whose worktree had test/b checked out (found
+    # by the stamp sweep). That room's own branch was never settled above;
+    # settle it now under the merged/pushed guard (never forced: -D was aimed
+    # at <branch>, not at a name grove inferred). Before the close, which can
+    # end grove when it is grove's own tab.
+    if [ -n "$canon_wt" ] && [ -z "$switched" ]; then
+      local ws_title; ws_title=$(grove_ws_field "$workspaces" "$ws" title)
+      if [ -n "$ws_title" ] && [ "$ws_title" != "$branch" ] \
+         && git -C "$REPO_PATH" show-ref --verify --quiet "refs/heads/$ws_title"; then
+        info "workspace $ws is room '$ws_title' — settling its branch too"
+        grove_reap_room_branch "$REPO_PATH" "$ws_title" "$def_branch" "" "$opt_keep"
+      fi
+    fi
     info "closing workspace ${_c_bld}$ws${_c_rst} ($label$away)…"
     local close_out
     close_out=$(CMUX_QUIET=1 "$CMUX" workspace close "$ws" --force 2>&1) \
